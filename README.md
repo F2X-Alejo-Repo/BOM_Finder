@@ -19,6 +19,54 @@ Enterprise-grade desktop intelligence workbench for PCB Bill of Materials (BOM) 
 | License | Proprietary |
 | Last Status Review | 2026-03-27 |
 
+## Visual Overview
+
+### Quick Navigation
+
+- [Project Status](#2-project-status)
+- [Versioning And Compatibility](#3-versioning-and-compatibility)
+- [Architecture Overview](#5-architecture-overview)
+- [Roadmap (High-Level)](#12-roadmap-high-level)
+- [Contribution Model](#13-contribution-model)
+
+### System Context
+
+```mermaid
+flowchart LR
+	U[Hardware Engineer or Sourcing Specialist] --> UI[Desktop UI: BOM Workbench]
+	UI --> APP[Application Layer]
+	APP --> CSV[CSV Ingestion: Parser and Normalizer]
+	APP --> DOM[Domain: Entities and Rules]
+	APP --> DB[(SQLite Persistence)]
+	APP -. planned .-> AI[AI Enrichment Pipeline]
+	AI -. planned .-> SRC[Approved External Sources]
+	APP --> EXP[Procurement Export]
+```
+
+### Delivery Lifecycle
+
+```mermaid
+flowchart TD
+	D1[Discover] --> D2[Frame]
+	D2 --> D3[Design]
+	D3 --> D4[Build]
+	D4 --> D5[Verify]
+	D5 --> D6[Release]
+	D6 --> D7[Learn]
+	D7 --> D1
+```
+
+### Phase Progress Snapshot
+
+| Program Phase | Status | Progress |
+|---|---|---|
+| Phase 1-3: Scaffold, Domain, CSV | In place | [##########] 100% |
+| Phase 4-5: Persistence and UI Shell | In place | [########--] 80% |
+| Phase 6-7: Import UX and Providers | In progress | [###-------] 30% |
+| Phase 8-10: Enrichment, Finder, Export Polish | Planned | [#---------] 10% |
+
+> Professional delivery note: feature completion is governed by acceptance, security, observability, and rollback gates, not only code availability.
+
 ## 1) Executive Summary
 
 BOM Workbench is a Python desktop application for engineering and sourcing teams that need a controlled, auditable pipeline from raw KiCad-style CSV BOM files to structured, decision-ready BOM datasets.

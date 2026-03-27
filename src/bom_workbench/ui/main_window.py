@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from typing import Final
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -14,7 +14,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
-    QShortcut,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
@@ -102,6 +101,16 @@ class MainWindow(QMainWindow):
             if widget is current_widget:
                 return page_key
         return PAGE_KEYS[0]
+
+    @property
+    def nav_buttons(self) -> list[QToolButton]:
+        """Expose navigation buttons for smoke tests and wiring."""
+        return [self._page_buttons[key] for key in PAGE_KEYS]
+
+    @property
+    def inspector(self) -> QWidget:
+        """Return the active inspector widget."""
+        return self.inspector_stack.currentWidget()
 
     def page_widget(self, page_key: str) -> QWidget | None:
         """Return the widget registered for a page key."""
