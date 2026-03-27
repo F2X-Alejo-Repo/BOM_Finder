@@ -1,0 +1,4 @@
+REFERENCE ,  VALUE  , PCB_FOOTPRINT , LCSC Part Number , Supplier URL , Qty , Manufacturer
+R1,100K,0402,C25744,https://jlcpcb.com/partdetail/C25744,1,Yageo
+C1,100nF,0402,C1525,https://jlcpcb.com/partdetail/C1525,2,Murata
+

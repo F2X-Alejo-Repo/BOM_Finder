@@ -1,0 +1,18 @@
+Designator,Comment,Footprint,LCSC Part #,LCSC Link,Qty,Manufacturer,MPN
+R1,10K,Resistor_0402_1pct,C10001,https://jlcpcb.com/partdetail/C10001,1,Yageo,RC0402FR-0710KL
+R2,10K,Resistor_0402_1pct,C10001,https://jlcpcb.com/partdetail/C10001,1,Yageo,RC0402FR-0710KL
+R3,10K,Resistor_0402_1pct,C10001,https://jlcpcb.com/partdetail/C10001,1,Yageo,RC0402FR-0710KL
+R4,10K,Resistor_0402_1pct,C10001,https://jlcpcb.com/partdetail/C10001,1,Yageo,RC0402FR-0710KL
+R5,10K,Resistor_0402_1pct,C10001,https://jlcpcb.com/partdetail/C10001,1,Yageo,RC0402FR-0710KL
+C1,100nF,Capacitor_0402_X7R,C10002,https://jlcpcb.com/partdetail/C10002,1,MuRata,GRM155R71C104KA88D
+C2,100nF,Capacitor_0402_X7R,C10002,https://jlcpcb.com/partdetail/C10002,1,MuRata,GRM155R71C104KA88D
+C3,100nF,Capacitor_0402_X7R,C10002,https://jlcpcb.com/partdetail/C10002,1,MuRata,GRM155R71C104KA88D
+U1,STM32F405RGT6,LQFP-64_10x10mm_P0.5mm,C10003,https://jlcpcb.com/partdetail/C10003,1,STMicroelectronics,STM32F405RGT6
+U2,ESP32-WROOM-32,Module_18x25.5mm,C10004,https://jlcpcb.com/partdetail/C10004,1,Espressif,ESP32-WROOM-32
+J1,USB-C_Receptacle,USB-C_16P,C10005,https://jlcpcb.com/partdetail/C10005,1,HRO,TYPE-C-31-M-12
+Q1,AO3400A,SOT-23,C10006,https://jlcpcb.com/partdetail/C10006,1,AOS,AO3400A
+L1,10uH,Inductor_2.0x1.6mm,C10007,https://jlcpcb.com/partdetail/C10007,1,Sunlord,SDR0201-100KL
+D1,SS14,SMA,D10008,https://jlcpcb.com/partdetail/C10008,1,Diodes Inc,SS14
+R6,47K,Resistor_0402_1pct,C10009,https://jlcpcb.com/partdetail/C10009,1,Yageo,RC0402FR-0747KL
+C4,1uF,Capacitor_0402_X5R,C10010,https://jlcpcb.com/partdetail/C10010,1,MuRata,GRM155R61C105KE15D
+TP1,Test_Point,TestPoint_1mm,C10011,https://jlcpcb.com/partdetail/C10011,1,Harwin,TP-001

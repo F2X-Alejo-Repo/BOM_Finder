@@ -1,0 +1,5 @@
+Designator,Comment,Footprint
+R1,10K,Resistor_0402_1pct
+C1,100nF,Capacitor_0402_X7R
+U1,MCU,QFN-32_5x5mm
+

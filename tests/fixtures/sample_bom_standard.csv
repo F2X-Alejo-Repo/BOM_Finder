@@ -1,0 +1,5 @@
+Designator,Comment,Footprint,LCSC Part #,LCSC Link
+"R1, R2, R3, R4",100K,Resistor_0402_1pct,C25744,https://jlcpcb.com/partdetail/C25744
+"C1, C2",100nF,Capacitor_0402_X7R,C1525,https://jlcpcb.com/partdetail/C1525
+U1,STM32F405RGT6,LQFP-64_10x10mm_P0.5mm,C15742,https://jlcpcb.com/partdetail/C15742
+
