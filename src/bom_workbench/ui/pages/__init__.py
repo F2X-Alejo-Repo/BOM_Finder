@@ -9,6 +9,7 @@ from PySide6 import QtWidgets
 __all__ = [
     "SimplePage",
     "create_card",
+    "BomTableModel",
     "BomTablePage",
     "ExportPage",
     "ImportPage",
@@ -60,7 +61,7 @@ def create_card(title: str, lines: Sequence[str]) -> QtWidgets.QGroupBox:
     return card
 
 
-from .bom_table_page import BomTablePage
+from .bom_table_page import BomTableModel, BomTablePage
 from .export_page import ExportPage
 from .import_page import ImportPage
 from .jobs_page import JobsPage
