@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -36,6 +37,8 @@ class _ProviderCard:
     reasoning_mode: QtWidgets.QComboBox
     test_button: QtWidgets.QPushButton
     refresh_button: QtWidgets.QPushButton
+    runtime_defaults: dict[str, Any] = field(default_factory=dict)
+    selected_model_hint: str = ""
     _model_placeholder: str = field(default="No models loaded yet")
 
 
@@ -114,10 +117,21 @@ class ProvidersPage(SimplePage):
         card = self._get_provider_card(provider)
         combo = card.model
 
-        current_selection = selected_model or combo.currentText().strip()
+        selected_hint = self._clean_text(card.selected_model_hint)
+        if selected_hint == card._model_placeholder:
+            selected_hint = ""
+        current_selection = (
+            self._clean_text(selected_model)
+            or selected_hint
+            or combo.currentText().strip()
+        )
+        if current_selection == card._model_placeholder:
+            current_selection = ""
         combo.blockSignals(True)
         combo.clear()
-        model_names = [model.strip() for model in models if model.strip()]
+        model_names = [self._clean_text(model) for model in models if self._clean_text(model)]
+        if current_selection and current_selection not in model_names:
+            model_names = [current_selection, *model_names]
         if model_names:
             combo.addItems(model_names)
             if current_selection and current_selection in model_names:
@@ -125,17 +139,101 @@ class ProvidersPage(SimplePage):
             else:
                 combo.setCurrentIndex(0)
         else:
-            combo.addItem(card._model_placeholder)
+            combo.addItem(current_selection or card._model_placeholder)
             combo.setCurrentIndex(0)
             combo.setEnabled(False)
         combo.blockSignals(False)
         if model_names:
             combo.setEnabled(True)
+        card.selected_model_hint = current_selection
+        card.runtime_defaults["cached_models"] = list(model_names)
+        if current_selection:
+            card.runtime_defaults["selected_model"] = current_selection
 
     def set_connection_status_text(self, provider: str, text: str) -> None:
         """Update the status text shown on a provider card."""
         card = self._get_provider_card(provider)
         card.connection_status_value.setText(text.strip() or "Not checked")
+
+    def set_provider_api_key(self, provider: str, api_key: str) -> None:
+        """Apply an API key value to a provider card."""
+
+        card = self._get_provider_card(provider)
+        card.api_key.setText(api_key.strip())
+
+    def set_provider_runtime_settings(
+        self,
+        provider: str,
+        *,
+        enabled: bool,
+        selected_model: str = "",
+        reasoning_mode: str = "",
+    ) -> None:
+        """Apply persisted runtime settings to a provider card."""
+
+        card = self._get_provider_card(provider)
+        card.enabled.setChecked(enabled)
+        card.runtime_defaults["enabled"] = enabled
+
+        normalized_model = selected_model.strip()
+        if normalized_model:
+            card.selected_model_hint = normalized_model
+            if card.model.findText(normalized_model) < 0:
+                existing_models = self._visible_model_names(card)
+                if normalized_model not in existing_models:
+                    existing_models = [normalized_model, *existing_models]
+                self.set_provider_models(
+                    provider,
+                    existing_models or [normalized_model],
+                    selected_model=normalized_model,
+                )
+            else:
+                card.model.setCurrentText(normalized_model)
+            card.runtime_defaults["selected_model"] = normalized_model
+        elif card.selected_model_hint:
+            card.runtime_defaults["selected_model"] = card.selected_model_hint
+
+        normalized_reasoning = reasoning_mode.strip().title()
+        if normalized_reasoning:
+            index = card.reasoning_mode.findText(normalized_reasoning)
+            if index >= 0:
+                card.reasoning_mode.setCurrentIndex(index)
+            card.runtime_defaults["reasoning_mode"] = normalized_reasoning
+
+    def hydrate_provider_settings(
+        self,
+        provider: str,
+        settings: Mapping[str, Any],
+    ) -> None:
+        """Hydrate a provider card from persisted runtime settings."""
+
+        normalized = self._normalize_runtime_settings(settings, provider=provider)
+        card = self._get_provider_card(provider)
+        card.runtime_defaults = normalized
+        cached_models = list(normalized["cached_models"])
+        selected_model = str(normalized["selected_model"])
+        if cached_models or selected_model:
+            self.set_provider_models(
+                provider,
+                cached_models or [selected_model],
+                selected_model=selected_model,
+            )
+        self.set_provider_runtime_settings(
+            provider,
+            enabled=bool(normalized["enabled"]),
+            selected_model=selected_model,
+            reasoning_mode=str(normalized["reasoning_mode"]),
+        )
+
+    def hydrate_provider_settings_bulk(
+        self,
+        settings_by_provider: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Hydrate multiple provider cards from persisted runtime settings."""
+
+        for provider, settings in settings_by_provider.items():
+            if provider in self._provider_cards:
+                self.hydrate_provider_settings(provider, settings)
 
     def apply_provider_capabilities(
         self,
@@ -289,14 +387,187 @@ class ProvidersPage(SimplePage):
         self.save_settings_clicked.emit(self.provider_settings())
 
     def _card_payload(self, card: _ProviderCard) -> dict[str, Any]:
+        payload = dict(card.runtime_defaults)
+        cached_models = self._normalize_models(payload.get("cached_models"))
+        if not cached_models:
+            cached_models = self._visible_model_names(card)
+
+        selected_model = card.model.currentText().strip()
+        if selected_model == card._model_placeholder:
+            selected_model = ""
+        reasoning_mode = card.reasoning_mode.currentText().strip() or "Auto"
+        timeout_seconds = self._normalize_int(payload.get("timeout_seconds"), default=60)
+        max_retries = self._normalize_int(payload.get("max_retries"), default=3)
+        max_concurrent = self._normalize_int(payload.get("max_concurrent"), default=5)
+        temperature = self._normalize_temperature(payload.get("temperature"))
+        reasoning_effort = self._normalize_reasoning_effort(
+            payload.get("reasoning_effort", reasoning_mode)
+        )
+
+        payload.update(
+            {
+                "provider": card.provider,
+                "enabled": card.enabled.isChecked(),
+                "api_key": card.api_key.text().strip(),
+                "selected_model": selected_model,
+                "reasoning_mode": reasoning_mode,
+                "reasoning_effort": reasoning_effort,
+                "connection_status": card.connection_status_value.text().strip(),
+                "cached_models": cached_models,
+                "timeout_seconds": timeout_seconds,
+                "max_retries": max_retries,
+                "max_concurrent": max_concurrent,
+                "temperature": temperature,
+                "auth_method": self._clean_text(payload.get("auth_method", "api_key"))
+                or "api_key",
+                "privacy_level": self._clean_text(payload.get("privacy_level", "full"))
+                or "full",
+                "manual_approval": bool(payload.get("manual_approval", False)),
+                "models_cached_at": self._normalize_datetime_text(
+                    payload.get("models_cached_at")
+                ),
+                "extra_config": self._normalize_extra_config(payload.get("extra_config")),
+                "runtime_defaults": dict(card.runtime_defaults),
+            }
+        )
+        return payload
+
+    def _visible_model_names(self, card: _ProviderCard) -> list[str]:
+        names: list[str] = []
+        for index in range(card.model.count()):
+            text = card.model.itemText(index).strip()
+            if text and text != card._model_placeholder and text not in names:
+                names.append(text)
+        return names
+
+    def _normalize_models(self, value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return []
+            if cleaned.startswith("["):
+                try:
+                    parsed = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    parsed = []
+                if isinstance(parsed, list):
+                    return [self._clean_text(item) for item in parsed if self._clean_text(item)]
+            return [segment.strip() for segment in cleaned.split(",") if segment.strip()]
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return [self._clean_text(item) for item in value if self._clean_text(item)]
+        text = self._clean_text(value)
+        return [text] if text else []
+
+    def _normalize_int(self, value: object, *, default: int) -> int:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        text = self._clean_text(value)
+        if text.isdigit():
+            return int(text)
+        return default
+
+    def _normalize_temperature(self, value: object) -> float | None:
+        if value in {None, ""}:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = self._clean_text(value)
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _normalize_reasoning_mode(self, value: object) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return "Auto"
+        lowered = text.casefold()
+        if lowered in {"auto", "default"}:
+            return "Auto"
+        if lowered in {"low", "medium", "high"}:
+            return lowered.title()
+        return text
+
+    def _normalize_reasoning_effort(self, value: object) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        lowered = text.casefold()
+        if lowered in {"auto", "default"}:
+            return ""
+        if lowered in {"low", "medium", "high"}:
+            return lowered
+        return lowered
+
+    def _normalize_datetime_text(self, value: object) -> str:
+        return self._clean_text(value)
+
+    def _normalize_extra_config(self, value: object) -> dict[str, Any] | str:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return text
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+            return text
+        return {}
+
+    def _normalize_runtime_settings(
+        self,
+        settings: Mapping[str, Any],
+        *,
+        provider: str,
+    ) -> dict[str, Any]:
+        provider_name = self._clean_text(settings.get("provider", provider)) or provider
+        enabled = bool(settings.get("enabled", True))
+        selected_model = self._clean_text(settings.get("selected_model", ""))
+        reasoning_mode = self._normalize_reasoning_mode(settings.get("reasoning_mode", "Auto"))
+        cached_models = self._normalize_models(settings.get("cached_models"))
+        timeout_seconds = self._normalize_int(settings.get("timeout_seconds"), default=60)
+        max_retries = self._normalize_int(settings.get("max_retries"), default=3)
+        max_concurrent = self._normalize_int(settings.get("max_concurrent"), default=5)
+        temperature = self._normalize_temperature(settings.get("temperature"))
+        reasoning_effort = self._normalize_reasoning_effort(
+            settings.get("reasoning_effort", reasoning_mode)
+        )
+        auth_method = self._clean_text(settings.get("auth_method", "api_key")) or "api_key"
+        privacy_level = self._clean_text(settings.get("privacy_level", "full")) or "full"
+        manual_approval = bool(settings.get("manual_approval", False))
+        models_cached_at = self._normalize_datetime_text(settings.get("models_cached_at"))
+        extra_config = self._normalize_extra_config(settings.get("extra_config"))
+
         return {
-            "provider": card.provider,
-            "enabled": card.enabled.isChecked(),
-            "api_key": card.api_key.text().strip(),
-            "selected_model": card.model.currentText().strip(),
-            "reasoning_mode": card.reasoning_mode.currentText().strip(),
-            "connection_status": card.connection_status_value.text().strip(),
+            "provider": provider_name,
+            "enabled": enabled,
+            "selected_model": selected_model,
+            "reasoning_mode": reasoning_mode,
+            "reasoning_effort": reasoning_effort,
+            "cached_models": cached_models,
+            "timeout_seconds": timeout_seconds,
+            "max_retries": max_retries,
+            "max_concurrent": max_concurrent,
+            "temperature": temperature,
+            "auth_method": auth_method,
+            "privacy_level": privacy_level,
+            "manual_approval": manual_approval,
+            "models_cached_at": models_cached_at,
+            "extra_config": extra_config,
         }
+
+    def _clean_text(self, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
 
     def _get_provider_card(self, provider: str) -> _ProviderCard:
         try:

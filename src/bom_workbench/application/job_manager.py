@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+
+import structlog
 
 from bom_workbench.domain.entities import Job
 from bom_workbench.domain.enums import JobState
@@ -25,7 +29,23 @@ from .event_bus import (
     JobStarted,
 )
 
-RowExecutor = Callable[[int], Awaitable[bool | None]]
+logger = structlog.get_logger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class RowExecutionResult:
+    """Normalized executor result used by adaptive row scheduling."""
+
+    success: bool
+    latency_ms: float = 0.0
+    usage: dict[str, int] = field(default_factory=dict)
+    error_category: str = ""
+    rate_limited: bool = False
+    retry_after_seconds: float | None = None
+
+
+RowExecutorResult = bool | None | RowExecutionResult
+RowExecutor = Callable[[int], Awaitable[RowExecutorResult]]
 
 
 @dataclass(slots=True, frozen=True)
@@ -34,6 +54,7 @@ class JobSubmission:
 
     job_id: int
     executor: RowExecutor
+    row_concurrency: int = 1
 
 
 class JobManager:
@@ -58,9 +79,16 @@ class JobManager:
         self._cancelled_jobs: set[int] = set()
         self._pause_condition = asyncio.Condition()
 
-    async def submit(self, job: Job, executor: RowExecutor) -> Job:
+    async def submit(
+        self,
+        job: Job,
+        executor: RowExecutor,
+        *,
+        row_concurrency: int = 1,
+    ) -> Job:
         """Persist a job as queued and schedule it for execution."""
 
+        normalized_row_concurrency = max(1, int(row_concurrency or 1))
         persisted = await self._repository.save(
             job.model_copy(update={"state": JobState.QUEUED.value})
         )
@@ -68,7 +96,13 @@ class JobManager:
             raise RuntimeError("Saved job did not return an id.")
 
         await self._publish(JobQueued(persisted.id, persisted.job_type, persisted.total_rows))
-        await self._queue.put(JobSubmission(persisted.id, executor))
+        await self._queue.put(
+            JobSubmission(
+                persisted.id,
+                executor,
+                row_concurrency=normalized_row_concurrency,
+            )
+        )
         self._ensure_runner()
         return persisted
 
@@ -132,44 +166,187 @@ class JobManager:
 
         completed_rows = started.completed_rows
         failed_rows = started.failed_rows
+        row_ids = list(_parse_target_row_ids(started.target_row_ids))
 
         try:
-            for row_id in _parse_target_row_ids(started.target_row_ids):
-                await self._wait_if_paused(started.id or submission.job_id)
-                if started.id in self._cancelled_jobs or submission.job_id in self._cancelled_jobs:
-                    await self._finalize_cancel(started, completed_rows, failed_rows)
-                    return
+            row_queue: asyncio.Queue[int] = asyncio.Queue()
+            for row_id in row_ids:
+                row_queue.put_nowait(row_id)
 
+            counter_lock = asyncio.Lock()
+            adaptive_lock = asyncio.Lock()
+            worker_cap = min(max(1, submission.row_concurrency), max(len(row_ids), 1))
+            worker_count = worker_cap
+            active_limit = min(worker_cap, 4) if worker_cap > 1 else 1
+            in_flight = 0
+            latency_window: deque[float] = deque(maxlen=8)
+            successful_samples = 0
+            cooldown_until = 0.0
+            adaptive_condition = asyncio.Condition()
+
+            async def process_row(row_id: int) -> RowExecutionResult:
+                nonlocal completed_rows, failed_rows
                 try:
-                    result = await submission.executor(row_id)
-                    if result is False:
-                        failed_rows += 1
-                    else:
-                        completed_rows += 1
+                    result = self._normalize_row_result(await submission.executor(row_id))
                 except Exception:
-                    failed_rows += 1
+                    result = RowExecutionResult(success=False, error_category="executor_exception")
 
-                if started.id in self._cancelled_jobs or submission.job_id in self._cancelled_jobs:
-                    await self._finalize_cancel(started, completed_rows, failed_rows)
+                async with counter_lock:
+                    if result.success:
+                        completed_rows += 1
+                    else:
+                        failed_rows += 1
+
+                    await self._repository.save(
+                        started.model_copy(
+                            update={
+                                "completed_rows": completed_rows,
+                                "failed_rows": failed_rows,
+                            }
+                        )
+                    )
+                    await self._publish(
+                        JobProgress(
+                            job_id=started.id or submission.job_id,
+                            job_type=started.job_type,
+                            row_id=row_id,
+                            completed_rows=completed_rows,
+                            failed_rows=failed_rows,
+                        )
+                    )
+                return result
+
+            async def worker() -> None:
+                nonlocal in_flight
+                while True:
+                    await self._wait_if_paused(started.id or submission.job_id)
+
+                    async with adaptive_condition:
+                        while True:
+                            if (
+                                started.id in self._cancelled_jobs
+                                or submission.job_id in self._cancelled_jobs
+                            ):
+                                return
+                            if row_queue.empty():
+                                return
+                            if in_flight < active_limit:
+                                row_id = row_queue.get_nowait()
+                                in_flight += 1
+                                break
+                            await adaptive_condition.wait()
+                    try:
+                        result = await process_row(row_id)
+                    finally:
+                        row_queue.task_done()
+                        async with adaptive_condition:
+                            in_flight -= 1
+                            adaptive_condition.notify_all()
+                    await update_adaptive_window(result)
+
+            async def update_adaptive_window(result: RowExecutionResult) -> None:
+                nonlocal active_limit, successful_samples, cooldown_until
+                if worker_cap <= 1:
                     return
 
-                await self._repository.save(
-                    started.model_copy(
-                        update={
-                            "completed_rows": completed_rows,
-                            "failed_rows": failed_rows,
-                        }
+                now = time.monotonic()
+                async with adaptive_lock:
+                    if result.latency_ms > 0:
+                        latency_window.append(result.latency_ms)
+
+                    if result.rate_limited or result.error_category == "rate_limit":
+                        next_limit = max(1, active_limit // 2)
+                        retry_after = result.retry_after_seconds
+                        if retry_after is None or retry_after <= 0:
+                            retry_after = 2.0
+                        cooldown_until = max(cooldown_until, now + min(retry_after, 30.0))
+                        successful_samples = 0
+                        if next_limit != active_limit:
+                            active_limit = next_limit
+                            async with adaptive_condition:
+                                adaptive_condition.notify_all()
+                        await self._publish_internal_log(
+                            "adaptive_row_concurrency_backoff",
+                            job_id=started.id or submission.job_id,
+                            active_limit=active_limit,
+                            worker_cap=worker_cap,
+                            retry_after_seconds=retry_after,
+                            error_category=result.error_category or "rate_limit",
+                        )
+                        return
+
+                    if result.error_category in {"timeout", "network_error", "server_error"}:
+                        if active_limit > 1:
+                            active_limit -= 1
+                            cooldown_until = max(cooldown_until, now + 2.0)
+                            successful_samples = 0
+                            async with adaptive_condition:
+                                adaptive_condition.notify_all()
+                            await self._publish_internal_log(
+                                "adaptive_row_concurrency_slowdown",
+                                job_id=started.id or submission.job_id,
+                                active_limit=active_limit,
+                                worker_cap=worker_cap,
+                                error_category=result.error_category,
+                            )
+                        return
+
+                    average_latency = (
+                        sum(latency_window) / len(latency_window)
+                        if latency_window
+                        else result.latency_ms
                     )
-                )
-                await self._publish(
-                    JobProgress(
-                        job_id=started.id or submission.job_id,
-                        job_type=started.job_type,
-                        row_id=row_id,
-                        completed_rows=completed_rows,
-                        failed_rows=failed_rows,
-                    )
-                )
+                    if average_latency >= 12_000 and active_limit > 1:
+                        active_limit -= 1
+                        cooldown_until = max(cooldown_until, now + 2.0)
+                        successful_samples = 0
+                        async with adaptive_condition:
+                            adaptive_condition.notify_all()
+                        await self._publish_internal_log(
+                            "adaptive_row_concurrency_latency_backoff",
+                            job_id=started.id or submission.job_id,
+                            active_limit=active_limit,
+                            worker_cap=worker_cap,
+                            average_latency_ms=round(average_latency, 2),
+                        )
+                        return
+
+                    if (
+                        result.success
+                        and active_limit < worker_cap
+                        and now >= cooldown_until
+                        and average_latency > 0
+                        and average_latency <= 7_500
+                    ):
+                        successful_samples += 1
+                        threshold = 2 if active_limit < 4 else 4
+                        if successful_samples >= threshold:
+                            active_limit += 1
+                            successful_samples = 0
+                            async with adaptive_condition:
+                                adaptive_condition.notify_all()
+                            await self._publish_internal_log(
+                                "adaptive_row_concurrency_increase",
+                                job_id=started.id or submission.job_id,
+                                active_limit=active_limit,
+                                worker_cap=worker_cap,
+                                average_latency_ms=round(average_latency, 2),
+                            )
+
+            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+            try:
+                await asyncio.gather(*workers)
+            finally:
+                for task in workers:
+                    if not task.done():
+                        task.cancel()
+                for task in workers:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+            if started.id in self._cancelled_jobs or submission.job_id in self._cancelled_jobs:
+                await self._finalize_cancel(started, completed_rows, failed_rows)
+                return
 
             final_state = (
                 JobState.COMPLETED if failed_rows == 0 else JobState.COMPLETED_WITH_ERRORS
@@ -238,6 +415,16 @@ class JobManager:
         if self._event_bus is None:
             return
         await self._event_bus.publish(event)
+
+    async def _publish_internal_log(self, event_name: str, **payload: Any) -> None:
+        """Optional debug hook for adaptive scheduling internals."""
+
+        logger.info(event_name, **payload)
+
+    def _normalize_row_result(self, result: RowExecutorResult) -> RowExecutionResult:
+        if isinstance(result, RowExecutionResult):
+            return result
+        return RowExecutionResult(success=result is not False)
 
 
 def _utc_now() -> datetime:

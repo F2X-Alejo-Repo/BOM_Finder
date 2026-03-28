@@ -1,0 +1,18 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.executeInFileDir": true,
+  "terminal.integrated.defaultProfile.windows": "bash",
+  "terminal.integrated.profiles.windows": {
+    "bash": {
+      "source": "Git Bash",
+      "args": ["--login", "-i"],
+      "env": {
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv"
+      }
+    }
+  },
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.python",
+    "editor.formatOnSave": true
+  }
+}

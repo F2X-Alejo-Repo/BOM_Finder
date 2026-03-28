@@ -43,6 +43,16 @@ PAGE_LABELS: Final[dict[str, str]] = {
     "settings": "Settings",
 }
 
+PAGE_SUBTITLES: Final[dict[str, str]] = {
+    "import": "Bring BOM files in cleanly and get straight to structured work.",
+    "bom_table": "Inspect the normalized BOM and push rows through enrichment with confidence.",
+    "part_finder": "Compare replacement candidates without losing context from the selected row.",
+    "providers": "Control model providers, credentials, and runtime behavior from one place.",
+    "jobs": "Watch long-running work and understand what the app is doing in real time.",
+    "export": "Produce polished procurement output instead of raw tables.",
+    "settings": "Tune workspace defaults and operational behavior.",
+}
+
 
 class MainWindow(QMainWindow):
     """Primary shell window for the BOM Workbench application."""
@@ -201,36 +211,74 @@ class MainWindow(QMainWindow):
         app_bar.setObjectName("AppBar")
         app_bar.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QHBoxLayout(app_bar)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(16)
 
         title_block = QWidget(app_bar)
         title_layout = QVBoxLayout(title_block)
         title_layout.setContentsMargins(0, 0, 0, 0)
-        title_layout.setSpacing(2)
+        title_layout.setSpacing(4)
+
+        brand = QLabel("BOM WORKBENCH", title_block)
+        brand.setObjectName("BrandBadge")
 
         title = QLabel(self._app_name, title_block)
         title.setObjectName("AppTitle")
-        title.setStyleSheet("font-size: 18pt; font-weight: 600;")
 
-        subtitle = QLabel(self._workspace_name, title_block)
-        subtitle.setProperty("muted", True)
+        self.page_context_label = QLabel(PAGE_LABELS[PAGE_KEYS[0]], title_block)
+        self.page_context_label.setObjectName("AppContext")
+        self.page_context_detail = QLabel(PAGE_SUBTITLES[PAGE_KEYS[0]], title_block)
+        self.page_context_detail.setObjectName("AppContextDetail")
+        self.page_context_detail.setWordWrap(True)
 
+        title_layout.addWidget(brand)
         title_layout.addWidget(title)
-        title_layout.addWidget(subtitle)
-        title_layout.addStretch(1)
+        title_layout.addWidget(self.page_context_label)
+        title_layout.addWidget(self.page_context_detail)
 
-        self.theme_button = QPushButton("Theme", app_bar)
+        action_cluster = QWidget(app_bar)
+        action_layout = QHBoxLayout(action_cluster)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.setSpacing(10)
+
+        self.import_quick_button = QPushButton("Import", action_cluster)
+        self.import_quick_button.setObjectName("PrimaryChromeButton")
+        self.import_quick_button.clicked.connect(self._emit_import_requested)
+
+        self.enrich_quick_button = QPushButton("Enrich Selected", action_cluster)
+        self.enrich_quick_button.setObjectName("SecondaryChromeButton")
+        self.enrich_quick_button.clicked.connect(self._emit_enrich_selected_requested)
+
+        self.export_quick_button = QPushButton("Export", action_cluster)
+        self.export_quick_button.setObjectName("SecondaryChromeButton")
+        self.export_quick_button.clicked.connect(self._emit_export_requested)
+
+        action_layout.addWidget(self.import_quick_button)
+        action_layout.addWidget(self.enrich_quick_button)
+        action_layout.addWidget(self.export_quick_button)
+
+        chrome_controls = QWidget(app_bar)
+        chrome_layout = QHBoxLayout(chrome_controls)
+        chrome_layout.setContentsMargins(0, 0, 0, 0)
+        chrome_layout.setSpacing(10)
+
+        self.theme_button = QPushButton("Noir", app_bar)
+        self.theme_button.setObjectName("themeButton")
         self.theme_button.setCheckable(True)
-        self.theme_button.setToolTip("Theme toggle placeholder")
+        self.theme_button.setToolTip("Dark theme styling is currently active")
+        self.theme_button.setChecked(True)
 
         self.workspace_button = QPushButton(self._workspace_name, app_bar)
+        self.workspace_button.setObjectName("workspaceButton")
         self.workspace_button.setToolTip("Workspace selector placeholder")
+
+        chrome_layout.addWidget(self.workspace_button)
+        chrome_layout.addWidget(self.theme_button)
 
         layout.addWidget(title_block)
         layout.addStretch(1)
-        layout.addWidget(self.workspace_button)
-        layout.addWidget(self.theme_button)
+        layout.addWidget(action_cluster)
+        layout.addWidget(chrome_controls)
 
         self.setMenuWidget(app_bar)
 
@@ -273,12 +321,23 @@ class MainWindow(QMainWindow):
         rail = QFrame(self)
         rail.setObjectName("NavRail")
         rail.setFrameShape(QFrame.Shape.StyledPanel)
-        rail.setMinimumWidth(200)
-        rail.setMaximumWidth(260)
+        rail.setMinimumWidth(236)
+        rail.setMaximumWidth(280)
 
         layout = QVBoxLayout(rail)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(18, 20, 18, 18)
+        layout.setSpacing(10)
+
+        rail_title = QLabel("Navigation", rail)
+        rail_title.setObjectName("NavSectionTitle")
+        rail_detail = QLabel(
+            "Core flows stay close at hand so the workspace feels focused instead of crowded.",
+            rail,
+        )
+        rail_detail.setObjectName("NavSectionDetail")
+        rail_detail.setWordWrap(True)
+        layout.addWidget(rail_title)
+        layout.addWidget(rail_detail)
 
         for page_key in PAGE_KEYS:
             button = QToolButton(rail)
@@ -296,7 +355,8 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        version_label = QLabel("Phase 5 shell", rail)
+        version_label = QLabel("Polished workspace shell", rail)
+        version_label.setObjectName("NavFooterLabel")
         version_label.setProperty("muted", True)
         layout.addWidget(version_label)
         return rail
@@ -308,13 +368,18 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
         self.status_text_label = QLabel("Ready", status_bar)
+        self.status_text_label.setObjectName("StatusPrimary")
         self.total_rows_label = QLabel("Rows: 0", status_bar)
         self.enriched_rows_label = QLabel("Enriched: 0", status_bar)
         self.connection_label = QLabel("Provider: idle", status_bar)
+        self.total_rows_label.setObjectName("StatusMetric")
+        self.enriched_rows_label.setObjectName("StatusMetric")
+        self.connection_label.setObjectName("StatusMetric")
         self.progress_bar = QProgressBar(status_bar)
+        self.progress_bar.setObjectName("FooterProgress")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFixedWidth(180)
+        self.progress_bar.setFixedWidth(220)
         self.progress_bar.setTextVisible(True)
 
         status_bar.addWidget(self.status_text_label, 1)
@@ -370,6 +435,8 @@ class MainWindow(QMainWindow):
         self.show_page("settings")
 
     def _update_status_page_label(self, page_key: str) -> None:
+        self.page_context_label.setText(PAGE_LABELS[page_key])
+        self.page_context_detail.setText(PAGE_SUBTITLES.get(page_key, ""))
         self.status_text_label.setText(f"Viewing {PAGE_LABELS[page_key]}")
 
     def _show_offset_page(self, offset: int) -> None:
@@ -384,9 +451,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
         title = QLabel(PAGE_LABELS[page_key], placeholder)
-        title.setStyleSheet("font-size: 20pt; font-weight: 600;")
+        title.setObjectName("PlaceholderHeading")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle = QLabel("Page content will be injected by the caller.", placeholder)
+        subtitle.setObjectName("PlaceholderBody")
         subtitle.setProperty("muted", True)
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addStretch(1)
@@ -404,8 +472,9 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         title = QLabel("Row Inspector", placeholder)
-        title.setStyleSheet("font-size: 16pt; font-weight: 600;")
+        title.setObjectName("InspectorPlaceholderHeading")
         body = QLabel("Select a BOM row to inspect details.", placeholder)
+        body.setObjectName("InspectorPlaceholderBody")
         body.setWordWrap(True)
         body.setProperty("muted", True)
         layout.addWidget(title)

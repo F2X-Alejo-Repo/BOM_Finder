@@ -55,7 +55,7 @@ class RowInspector(QFrame):
         root.setSpacing(12)
 
         title = QLabel("Row Inspector", self)
-        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        title.setObjectName("inspectorHeading")
         root.addWidget(title)
 
         self.subtitle = QLabel(

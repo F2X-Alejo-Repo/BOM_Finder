@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
+import structlog
 from pydantic import BaseModel
 
 from ...domain.ports import (
@@ -19,6 +20,8 @@ from ...domain.ports import (
 )
 from .base import (
     build_timeout,
+    classify_http_error,
+    classify_request_error,
     model_from_payload,
     now_ms,
     response_usage_from_openai,
@@ -29,6 +32,8 @@ from .base import (
 OPENAI_BASE_URL = "https://api.openai.com"
 OPENAI_MODELS_PATH = "/v1/models"
 OPENAI_CHAT_PATH = "/v1/chat/completions"
+
+logger = structlog.get_logger(__name__)
 
 
 class OpenAIProviderAdapter:
@@ -140,17 +145,21 @@ class OpenAIProviderAdapter:
                 response = await client.post(OPENAI_CHAT_PATH, json=payload)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response else 0
+            status_code, retry_after_seconds, error_category = classify_http_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
                 provider=self.get_name(),
                 latency_ms=now_ms(start),
                 success=False,
-                error_message=f"OpenAI chat failed with HTTP {status_code}.",
-                raw_response={"status_code": status_code},
+                error_message=f"OpenAI chat failed with HTTP {status_code or 0}.",
+                raw_response={"status_code": status_code or 0},
+                status_code=status_code,
+                retry_after_seconds=retry_after_seconds,
+                error_category=error_category,
             )
         except httpx.RequestError as exc:
+            error_category = classify_request_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
@@ -159,6 +168,7 @@ class OpenAIProviderAdapter:
                 success=False,
                 error_message=f"OpenAI chat failed: {type(exc).__name__}.",
                 raw_response={"error_type": type(exc).__name__},
+                error_category=error_category,
             )
 
         payload = response.json()
@@ -210,6 +220,13 @@ class OpenAIProviderAdapter:
         if config.reasoning_effort:
             payload["reasoning_effort"] = config.reasoning_effort
 
+        logger.info(
+            "openai_structured_chat_request",
+            model=config.model,
+            request_payload=payload,
+            message_count=len(request_messages),
+        )
+
         start = time.perf_counter()
         try:
             async with httpx.AsyncClient(
@@ -220,17 +237,21 @@ class OpenAIProviderAdapter:
                 response = await client.post(OPENAI_CHAT_PATH, json=payload)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response else 0
+            status_code, retry_after_seconds, error_category = classify_http_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
                 provider=self.get_name(),
                 latency_ms=now_ms(start),
                 success=False,
-                error_message=f"OpenAI structured chat failed with HTTP {status_code}.",
-                raw_response={"status_code": status_code},
+                error_message=f"OpenAI structured chat failed with HTTP {status_code or 0}.",
+                raw_response={"status_code": status_code or 0},
+                status_code=status_code,
+                retry_after_seconds=retry_after_seconds,
+                error_category=error_category,
             )
         except httpx.RequestError as exc:
+            error_category = classify_request_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
@@ -239,9 +260,15 @@ class OpenAIProviderAdapter:
                 success=False,
                 error_message=f"OpenAI structured chat failed: {type(exc).__name__}.",
                 raw_response={"error_type": type(exc).__name__},
+                error_category=error_category,
             )
 
         payload = response.json()
+        logger.info(
+            "openai_structured_chat_response",
+            model=config.model,
+            raw_response=payload,
+        )
         text = self._extract_text(payload)
         if text is None:
             return safe_provider_response(
@@ -257,6 +284,13 @@ class OpenAIProviderAdapter:
         try:
             parsed = response_schema.model_validate_json(text)
         except Exception as exc:
+            logger.warning(
+                "openai_structured_chat_validation_failed",
+                model=config.model,
+                error_type=type(exc).__name__,
+                response_text=text,
+                raw_response=payload,
+            )
             return safe_provider_response(
                 content=text,
                 model=config.model,
@@ -268,8 +302,14 @@ class OpenAIProviderAdapter:
                     f"{type(exc).__name__}."
                 ),
                 raw_response=payload,
+                error_category="validation_error",
             )
 
+        logger.info(
+            "openai_structured_chat_validation_succeeded",
+            model=config.model,
+            normalized_response=json.loads(parsed.model_dump_json()),
+        )
         return safe_provider_response(
             content=parsed.model_dump_json(),
             model=config.model,

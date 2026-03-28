@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import httpx
+import structlog
 from pydantic import BaseModel
 
 from ...domain.ports import (
@@ -19,6 +20,8 @@ from ...domain.ports import (
 )
 from .base import (
     build_timeout,
+    classify_http_error,
+    classify_request_error,
     model_from_payload,
     now_ms,
     response_usage_from_anthropic,
@@ -30,6 +33,8 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_MODELS_PATH = "/v1/models"
 ANTHROPIC_MESSAGES_PATH = "/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+logger = structlog.get_logger(__name__)
 
 
 class AnthropicProviderAdapter:
@@ -140,17 +145,21 @@ class AnthropicProviderAdapter:
                 response = await client.post(ANTHROPIC_MESSAGES_PATH, json=payload)
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response else 0
+            status_code, retry_after_seconds, error_category = classify_http_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
                 provider=self.get_name(),
                 latency_ms=now_ms(start),
                 success=False,
-                error_message=f"Anthropic chat failed with HTTP {status_code}.",
-                raw_response={"status_code": status_code},
+                error_message=f"Anthropic chat failed with HTTP {status_code or 0}.",
+                raw_response={"status_code": status_code or 0},
+                status_code=status_code,
+                retry_after_seconds=retry_after_seconds,
+                error_category=error_category,
             )
         except httpx.RequestError as exc:
+            error_category = classify_request_error(exc)
             return safe_provider_response(
                 content="",
                 model=config.model,
@@ -159,6 +168,7 @@ class AnthropicProviderAdapter:
                 success=False,
                 error_message=f"Anthropic chat failed: {type(exc).__name__}.",
                 raw_response={"error_type": type(exc).__name__},
+                error_category=error_category,
             )
 
         payload = response.json()
@@ -199,6 +209,16 @@ class AnthropicProviderAdapter:
             config.system_prompt,
             "Return only valid JSON that matches this schema:\n" + schema_text,
         )
+        logger.info(
+            "anthropic_structured_chat_request",
+            model=config.model,
+            messages=structured_messages,
+            system_prompt=structured_system,
+            max_tokens=config.max_tokens,
+            temperature=config.temperature,
+            timeout_seconds=config.timeout_seconds,
+            reasoning_effort=config.reasoning_effort,
+        )
         result = await self.chat(
             structured_messages,
             ChatConfig(
@@ -212,12 +232,28 @@ class AnthropicProviderAdapter:
                 system_prompt=structured_system,
             ),
         )
+        logger.info(
+            "anthropic_structured_chat_response",
+            model=config.model,
+            success=result.success,
+            latency_ms=result.latency_ms,
+            usage=result.usage,
+            response_text=result.content,
+            raw_response=result.raw_response,
+        )
         if not result.success:
             return result
 
         try:
             parsed = response_schema.model_validate_json(result.content)
         except Exception as exc:
+            logger.warning(
+                "anthropic_structured_chat_validation_failed",
+                model=config.model,
+                error_type=type(exc).__name__,
+                response_text=result.content,
+                raw_response=result.raw_response,
+            )
             return safe_provider_response(
                 content=result.content,
                 model=config.model,
@@ -230,8 +266,14 @@ class AnthropicProviderAdapter:
                 ),
                 raw_response=result.raw_response,
                 usage=result.usage,
+                error_category="validation_error",
             )
 
+        logger.info(
+            "anthropic_structured_chat_validation_succeeded",
+            model=config.model,
+            normalized_response=json.loads(parsed.model_dump_json()),
+        )
         return safe_provider_response(
             content=parsed.model_dump_json(),
             model=config.model,

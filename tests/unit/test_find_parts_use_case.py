@@ -183,6 +183,119 @@ async def test_find_candidates_from_explicit_criteria_uses_priority_order() -> N
 
 
 @pytest.mark.anyio
+async def test_find_candidates_with_row_and_criteria_uses_detached_context_copy() -> None:
+    row = _make_row(
+        id=5,
+        lcsc_part_number="C11111",
+        mpn="BASE-MPN",
+        comment="original comment",
+        footprint="0603",
+        source_url="https://vendor.test/base",
+    )
+    repo = FakeRepository([row])
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Gamma Components",
+                "mpn": "ALT-MPN",
+                "footprint": "0805",
+                "value_summary": "override value",
+                "stock_qty": 120,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ]
+    )
+    use_case = FindPartsUseCase(repo, FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        row_id=5,
+        criteria=PartSearchCriteria(
+            part_number="C22222",
+            source_url="https://vendor.test/override",
+            comment="override comment",
+            footprint="0805",
+        ),
+    )
+
+    assert len(results) == 1
+    assert use_case._retriever.calls[0].lcsc_part_number == "C22222"
+    assert use_case._retriever.calls[0].source_url == "https://vendor.test/override"
+    assert use_case._retriever.calls[0].comment == "override comment"
+    assert use_case._retriever.calls[0].footprint == "0805"
+    assert repo.rows[5].lcsc_part_number == "C11111"
+    assert repo.rows[5].source_url == "https://vendor.test/base"
+    assert repo.rows[5].comment == "original comment"
+    assert repo.rows[5].footprint == "0603"
+
+
+@pytest.mark.anyio
+async def test_find_candidates_applies_requested_filters() -> None:
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Good Parts",
+                "mpn": "GOOD-1",
+                "footprint": "0603",
+                "value_summary": "10k resistor",
+                "stock_qty": 250,
+                "lifecycle_status": "active",
+                "confidence": "high",
+                "lcsc_part_number": "C12345",
+                "lcsc_link": "https://www.lcsc.com/product-detail/C12345.html",
+            },
+            {
+                "manufacturer": "Risky Parts",
+                "mpn": "RISKY-1",
+                "footprint": "0603",
+                "value_summary": "10k resistor",
+                "stock_qty": 250,
+                "lifecycle_status": "eol",
+                "confidence": "high",
+                "lcsc_part_number": "C54321",
+                "lcsc_link": "https://www.lcsc.com/product-detail/C54321.html",
+            },
+            {
+                "manufacturer": "NoStock Parts",
+                "mpn": "NOSTOCK-1",
+                "footprint": "0603",
+                "value_summary": "10k resistor",
+                "stock_qty": 0,
+                "lifecycle_status": "active",
+                "confidence": "high",
+                "lcsc_part_number": "C99999",
+                "lcsc_link": "https://www.lcsc.com/product-detail/C99999.html",
+            },
+            {
+                "manufacturer": "OffSite Parts",
+                "mpn": "OFFSITE-1",
+                "footprint": "0603",
+                "value_summary": "10k resistor",
+                "stock_qty": 250,
+                "lifecycle_status": "active",
+                "confidence": "high",
+                "part_number": "ALT-1",
+                "lcsc_link": "https://vendor.test/parts/alt-1",
+            },
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        criteria=PartSearchCriteria(
+            part_number="C12345",
+            footprint="0603",
+            value="10k resistor",
+            active_only=True,
+            in_stock=True,
+            lcsc_available=True,
+        )
+    )
+
+    assert [result.candidate.mpn for result in results] == ["GOOD-1"]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "candidate_payload",
     [
@@ -296,3 +409,54 @@ async def test_apply_replacement_persists_selected_supplier_fields() -> None:
     assert row.source_url == "https://vendor.test/parts/acm-123"
     assert row.source_confidence == "high"
     assert "Applied replacement" in row.sourcing_notes
+
+
+@pytest.mark.anyio
+async def test_build_replacement_batches_groups_similar_rows() -> None:
+    use_case = FindPartsUseCase(FakeRepository([]), FakeRetriever([]))
+    rows = [
+        _make_row(id=20, mpn="CAP-100N", designator="C1", footprint="0603", comment="100nF"),
+        _make_row(id=21, mpn="CAP-100N", designator="C2", footprint="0603", comment="100nF"),
+        _make_row(id=22, mpn="REG-3V3", designator="U1", footprint="SOT-223", comment="3.3V regulator"),
+    ]
+
+    batches = use_case.build_replacement_batches(rows)
+
+    assert len(batches) == 2
+    assert batches[0].row_ids == (20, 21)
+    assert batches[0].designators == ("C1", "C2")
+    assert batches[0].exemplar_row_id == 20
+    assert batches[1].row_ids == (22,)
+
+
+@pytest.mark.anyio
+async def test_apply_replacement_to_rows_updates_each_row() -> None:
+    row_a = _make_row(id=30, mpn="OLD-A", comment="old part a")
+    row_b = _make_row(id=31, mpn="OLD-B", comment="old part b")
+    repo = FakeRepository([row_a, row_b])
+    use_case = FindPartsUseCase(repo, FakeRetriever([]))
+    candidate = _make_candidate(
+        manufacturer="Acme",
+        mpn="ACM-BULK",
+        footprint="0603",
+        package="0603",
+        value_summary="10k resistor",
+        lcsc_link="https://vendor.test/parts/acm-bulk",
+        lcsc_part_number="C54321",
+        stock_qty=250,
+        lifecycle_status=LifecycleStatus.ACTIVE,
+        confidence=Confidence.HIGH,
+        match_score=0.91,
+        match_explanation="Strong grouped match",
+        part_number="C54321",
+        description="10k resistor",
+        stock_status="high",
+    )
+
+    results = await use_case.apply_replacement_to_rows([30, 31], candidate, confirmed=True)
+
+    assert len(results) == 2
+    assert row_a.mpn == "ACM-BULK"
+    assert row_b.mpn == "ACM-BULK"
+    assert row_a.replacement_status == "user_accepted"
+    assert row_b.replacement_status == "user_accepted"

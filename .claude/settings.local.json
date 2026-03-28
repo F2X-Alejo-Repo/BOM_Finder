@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where python:*)",
+      "Bash(python -m venv .venv)",
+      "Bash(.venv/Scripts/python --version)"
+    ]
+  }
+}

@@ -18,6 +18,7 @@ from ..domain.value_objects import EvidenceRecord, ReplacementCandidate, SearchK
 __all__ = [
     "FindPartsUseCase",
     "PartSearchCriteria",
+    "ReplacementBatch",
     "ReplacementApplicationResult",
     "ReplacementConfirmationRequired",
     "ReplacementSearchResult",
@@ -57,6 +58,9 @@ class PartSearchCriteria:
     category: str = ""
     param_summary: str = ""
     manufacturer: str = ""
+    active_only: bool = False
+    in_stock: bool = False
+    lcsc_available: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -77,6 +81,17 @@ class ReplacementSearchResult:
     score: float
     explanation: str
     requires_manual_review: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ReplacementBatch:
+    """A grouped batch of BOM rows that can share one replacement search."""
+
+    group_key: str
+    label: str
+    row_ids: tuple[int, ...]
+    designators: tuple[str, ...]
+    exemplar_row_id: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -134,6 +149,7 @@ class FindPartsUseCase:
         if row_id is None and criteria is None:
             raise ValueError("Either row_id or criteria must be provided.")
 
+        criteria_data = self._coerce_criteria(criteria)
         context_row = await self._resolve_context_row(row_id=row_id, criteria=criteria)
         search_resolution = self.resolve_search_keys(context_row, criteria=criteria)
         if not search_resolution.primary_value:
@@ -153,6 +169,8 @@ class FindPartsUseCase:
                     "match_explanation": score.explanation,
                 }
             )
+            if not self._candidate_matches_filters(ranked_candidate, criteria_data):
+                continue
             results.append(
                 ReplacementSearchResult(
                     candidate=ranked_candidate,
@@ -181,6 +199,56 @@ class FindPartsUseCase:
         self._apply_candidate_to_row(row, candidate_model)
         saved_row = await self._repository.save_row(row)
         return ReplacementApplicationResult(row=saved_row, candidate=candidate_model, applied=True)
+
+    async def apply_replacement_to_rows(
+        self,
+        row_ids: Sequence[int],
+        candidate: ReplacementCandidate | Mapping[str, Any],
+        confirmed: bool,
+    ) -> list[ReplacementApplicationResult]:
+        """Persist one confirmed replacement across multiple BOM rows."""
+
+        normalized_row_ids: list[int] = []
+        for row_id in row_ids:
+            value = int(row_id)
+            if value > 0 and value not in normalized_row_ids:
+                normalized_row_ids.append(value)
+        results: list[ReplacementApplicationResult] = []
+        for row_id in normalized_row_ids:
+            results.append(await self.apply_replacement(row_id, candidate, confirmed))
+        return results
+
+    def build_replacement_batches(self, rows: Sequence[BomRow]) -> list[ReplacementBatch]:
+        """Group similar rows so one candidate search can be reused safely."""
+
+        grouped: "OrderedDict[str, list[BomRow]]" = OrderedDict()
+        for row in rows:
+            row_id = int(row.id or 0)
+            if row_id <= 0:
+                continue
+            key = self._replacement_group_key(row)
+            grouped.setdefault(key, []).append(row)
+
+        batches: list[ReplacementBatch] = []
+        for key, grouped_rows in grouped.items():
+            exemplar = grouped_rows[0]
+            designators = tuple(
+                self._clean_text(row.designator) or f"Row {int(row.id or 0)}"
+                for row in grouped_rows
+            )
+            row_ids = tuple(int(row.id or 0) for row in grouped_rows if int(row.id or 0) > 0)
+            if not row_ids:
+                continue
+            batches.append(
+                ReplacementBatch(
+                    group_key=key,
+                    label=self._replacement_group_label(exemplar),
+                    row_ids=row_ids,
+                    designators=designators,
+                    exemplar_row_id=row_ids[0],
+                )
+            )
+        return batches
 
     def resolve_search_keys(
         self,
@@ -267,7 +335,7 @@ class FindPartsUseCase:
         base_row: BomRow | None = None,
     ) -> BomRow:
         criteria_data = self._coerce_criteria(criteria)
-        row = base_row.model_copy(deep=True) if base_row is not None else BomRow(project_id=0)
+        row = self._detached_row_copy(base_row) if base_row is not None else BomRow(project_id=0)
         row.lcsc_part_number = self._first_non_empty(
             criteria_data.get("lcsc_part_number", ""),
             self._criteria_part_number(criteria_data, prefer_lcsc=True),
@@ -296,6 +364,10 @@ class FindPartsUseCase:
             row.manufacturer,
         )
         return row
+
+    def _detached_row_copy(self, row: BomRow) -> BomRow:
+        data = row.model_dump(exclude={"project"})
+        return BomRow.model_validate(data)
 
     async def _load_row(self, row_id: int) -> BomRow:
         row = await self._repository.get_row(row_id)
@@ -469,6 +541,35 @@ class FindPartsUseCase:
             ]
         )
 
+    def _replacement_group_key(self, row: BomRow) -> str:
+        lcsc_part_number = self._clean_text(row.lcsc_part_number)
+        if lcsc_part_number:
+            return f"lcsc:{self._normalize_key(lcsc_part_number)}"
+        mpn = self._clean_text(row.mpn)
+        if mpn:
+            return f"mpn:{self._normalize_key(mpn)}"
+        manufacturer = self._clean_text(row.manufacturer)
+        value = self._clean_text(row.comment or row.value_raw)
+        footprint = self._clean_text(row.footprint)
+        return "|".join(
+            [
+                "shape",
+                self._normalize_key(manufacturer),
+                self._normalize_key(value),
+                self._normalize_key(footprint),
+            ]
+        )
+
+    def _replacement_group_label(self, row: BomRow) -> str:
+        return self._first_non_empty(
+            row.mpn,
+            row.lcsc_part_number,
+            row.comment,
+            row.value_raw,
+            row.designator,
+            "replacement batch",
+        )
+
     def _requires_manual_review(self, candidate: ReplacementCandidate, score: float) -> bool:
         if score < self._manual_review_threshold:
             return True
@@ -486,6 +587,23 @@ class FindPartsUseCase:
         if candidate.stock_qty is not None and candidate.stock_qty <= 0:
             return True
         return self._normalize_stock_status(candidate.stock_status) in _OUT_OF_STOCK_STATUSES
+
+    def _candidate_matches_filters(
+        self,
+        candidate: ReplacementCandidate,
+        criteria: Mapping[str, Any],
+    ) -> bool:
+        if self._criteria_flag(criteria, "active_only") and self._is_risky_lifecycle(
+            candidate.lifecycle_status
+        ):
+            return False
+        if self._criteria_flag(criteria, "in_stock") and self._is_out_of_stock(candidate):
+            return False
+        if self._criteria_flag(criteria, "lcsc_available") and not self._candidate_has_lcsc_availability(
+            candidate
+        ):
+            return False
+        return True
 
     def _apply_candidate_to_row(self, row: BomRow, candidate: ReplacementCandidate) -> None:
         row.replacement_candidate_part_number = self._first_non_empty(
@@ -565,7 +683,7 @@ class FindPartsUseCase:
     def _coerce_criteria(
         self,
         criteria: PartSearchCriteria | Mapping[str, Any] | None,
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         if criteria is None:
             return {}
         if isinstance(criteria, PartSearchCriteria):
@@ -573,16 +691,31 @@ class FindPartsUseCase:
         else:
             data = dict(criteria)
 
-        normalized: dict[str, str] = {}
+        normalized: dict[str, Any] = {}
         for key, value in data.items():
             if value is None:
                 continue
             if isinstance(value, bool):
+                normalized[self._normalize_key(key)] = value
                 continue
             if isinstance(value, Mapping):
                 continue
             normalized[self._normalize_key(key)] = self._clean_text(value)
         return normalized
+
+    def _criteria_flag(self, criteria: Mapping[str, Any], key: str) -> bool:
+        value = criteria.get(self._normalize_key(key), False)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().casefold() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _candidate_has_lcsc_availability(self, candidate: ReplacementCandidate) -> bool:
+        if self._looks_like_lcsc_part_number(candidate.lcsc_part_number):
+            return True
+        link = self._clean_text(candidate.lcsc_link).casefold()
+        return "lcsc.com" in link
 
     def _criteria_part_number(self, criteria: Mapping[str, str], *, prefer_lcsc: bool) -> str:
         part_number = self._clean_text(criteria.get("part_number", ""))

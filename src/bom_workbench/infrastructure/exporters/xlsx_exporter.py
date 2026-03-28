@@ -11,6 +11,7 @@ from time import perf_counter
 from typing import Any
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -189,7 +190,11 @@ class XlsxExporter(IExporter):
         left_alignment = Alignment(horizontal="left", vertical="center")
 
         for column_index, header in enumerate(headers, start=1):
-            cell = sheet.cell(row=1, column=column_index, value=header)
+            cell = sheet.cell(
+                row=1,
+                column=column_index,
+                value=self._worksheet_safe_value(header),
+            )
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = left_alignment
@@ -241,18 +246,21 @@ class XlsxExporter(IExporter):
 
         current_row = 1
         for label, value, font, fill in entries:
-            sheet.cell(row=current_row, column=1, value=label).font = font
+            safe_label = self._worksheet_safe_value(label)
+            sheet.cell(row=current_row, column=1, value=safe_label).font = font
             sheet.cell(row=current_row, column=1).alignment = left_alignment
             if fill is not None:
                 sheet.cell(row=current_row, column=1).fill = fill
             if value is not None:
-                sheet.cell(row=current_row, column=2, value=value).font = value_font
+                safe_value = self._worksheet_safe_value(value)
+                sheet.cell(row=current_row, column=2, value=safe_value).font = value_font
                 sheet.cell(row=current_row, column=2).alignment = left_alignment
             current_row += 1
 
         if warnings:
             for warning in warnings:
-                sheet.cell(row=current_row, column=1, value=warning).font = value_font
+                safe_warning = self._worksheet_safe_value(warning)
+                sheet.cell(row=current_row, column=1, value=safe_warning).font = value_font
                 sheet.cell(row=current_row, column=1).alignment = left_alignment
                 current_row += 1
         else:
@@ -274,6 +282,7 @@ class XlsxExporter(IExporter):
         return [field for field in sample.keys() if field != "project"]
 
     def _sanitize_value(self, value: Any, options: ExportOptions) -> Any:
+        value = self._worksheet_safe_value(value)
         if not options.sanitize_formulas:
             return value
         if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
@@ -288,11 +297,23 @@ class XlsxExporter(IExporter):
         warnings: list[str] = []
         for header, field in columns:
             value = row.get(field, "")
+            if isinstance(value, str) and self._contains_illegal_characters(value):
+                warnings.append(f"{field}: illegal worksheet characters removed")
             if header == "LCSC LINK" and value and not isinstance(value, str):
                 warnings.append(f"{field}: non-string hyperlink value converted to text")
             if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
                 warnings.append(f"{field}: formula-like text sanitized")
         return warnings
+
+    def _worksheet_safe_value(self, value: Any) -> Any:
+        if isinstance(value, datetime) and value.tzinfo is not None:
+            return value.astimezone(UTC).replace(tzinfo=None)
+        if isinstance(value, str):
+            return ILLEGAL_CHARACTERS_RE.sub("", value)
+        return value
+
+    def _contains_illegal_characters(self, value: str) -> bool:
+        return bool(ILLEGAL_CHARACTERS_RE.search(value))
 
     def _source_files(self, rows: Sequence[BomRow]) -> str:
         files = sorted({str(row.source_file).strip() for row in rows if str(row.source_file).strip()})

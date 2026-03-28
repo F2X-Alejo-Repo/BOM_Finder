@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -124,6 +125,9 @@ def safe_provider_response(
     raw_response: dict[str, Any] | None = None,
     success: bool = True,
     error_message: str = "",
+    status_code: int | None = None,
+    retry_after_seconds: float | None = None,
+    error_category: str = "",
 ) -> ProviderResponse:
     return ProviderResponse(
         content=content,
@@ -134,7 +138,62 @@ def safe_provider_response(
         latency_ms=latency_ms,
         success=success,
         error_message=sanitize_error_text(error_message),
+        status_code=status_code,
+        retry_after_seconds=retry_after_seconds,
+        error_category=error_category,
     )
+
+
+def parse_retry_after_seconds(value: Any) -> float | None:
+    """Best-effort parser for HTTP Retry-After values."""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        seconds = float(stripped)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(stripped)
+        except (TypeError, ValueError, IndexError):
+            return None
+        remaining = retry_at.timestamp() - time.time()
+        return round(max(0.0, remaining), 3)
+    return seconds if seconds >= 0 else None
+
+
+def classify_http_error(
+    exc: httpx.HTTPStatusError,
+) -> tuple[int | None, float | None, str]:
+    """Return structured metadata for provider HTTP failures."""
+
+    response = exc.response
+    if response is None:
+        return None, None, "http_error"
+
+    status_code = response.status_code
+    retry_after = parse_retry_after_seconds(response.headers.get("Retry-After"))
+    if status_code == 429:
+        return status_code, retry_after, "rate_limit"
+    if 500 <= status_code <= 599:
+        return status_code, retry_after, "server_error"
+    return status_code, retry_after, "http_error"
+
+
+def classify_request_error(exc: httpx.RequestError) -> str:
+    """Group transport errors into a small set of adaptive categories."""
+
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    return "network_error"
 
 
 def model_from_payload(

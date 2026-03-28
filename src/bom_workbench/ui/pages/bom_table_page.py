@@ -140,6 +140,7 @@ class BomTablePage(SimplePage):
     """Page for the canonical BOM table and enrichment summary."""
 
     row_selected = Signal(dict)
+    selection_changed = Signal(list)
 
     def __init__(self) -> None:
         super().__init__(
@@ -170,7 +171,7 @@ class BomTablePage(SimplePage):
         self.table_view.setSelectionBehavior(
             QTableView.SelectionBehavior.SelectRows
         )
-        self.table_view.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.table_view.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSortingEnabled(False)
         self.table_view.verticalHeader().setVisible(False)
@@ -183,6 +184,9 @@ class BomTablePage(SimplePage):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table_view.selectionModel().currentRowChanged.connect(
             self._handle_current_row_changed
+        )
+        self.table_view.selectionModel().selectionChanged.connect(
+            self._handle_selection_changed
         )
 
         self.empty_state = QLabel(
@@ -203,6 +207,23 @@ class BomTablePage(SimplePage):
         self.empty_state.setVisible(not has_rows)
         if not has_rows:
             self.row_selected.emit({})
+            self.selection_changed.emit([])
+
+    def selected_row_payloads(self) -> list[dict[str, Any]]:
+        selection_model = self.table_view.selectionModel()
+        if selection_model is None:
+            return []
+        row_indexes = selection_model.selectedRows()
+        payloads: list[dict[str, Any]] = []
+        seen_rows: set[int] = set()
+        for index in row_indexes:
+            if not index.isValid() or index.row() in seen_rows:
+                continue
+            seen_rows.add(index.row())
+            row = self.table_model.row_at(index.row())
+            if row is not None:
+                payloads.append(row)
+        return payloads
 
     def _handle_current_row_changed(
         self, current: QModelIndex, previous: QModelIndex
@@ -214,3 +235,7 @@ class BomTablePage(SimplePage):
         row = self.table_model.row_at(current.row())
         if row is not None:
             self.row_selected.emit(row)
+
+    def _handle_selection_changed(self, selected: object, deselected: object) -> None:
+        del selected, deselected
+        self.selection_changed.emit(self.selected_row_payloads())

@@ -8,36 +8,36 @@ from typing import Final
 from PySide6.QtWidgets import QApplication, QWidget
 
 COLORS: Final[dict[str, str]] = {
-    "bg_primary": "#1a1a2e",
-    "bg_secondary": "#16213e",
-    "bg_tertiary": "#0f3460",
-    "bg_surface": "#1e2746",
-    "text_primary": "#e8e8e8",
-    "text_secondary": "#a0a0b0",
-    "text_disabled": "#606070",
-    "accent_primary": "#4a9eff",
-    "accent_hover": "#6bb3ff",
-    "accent_pressed": "#3580d4",
-    "status_success": "#4ade80",
-    "status_warning": "#fbbf24",
-    "status_error": "#f87171",
-    "status_info": "#60a5fa",
-    "border_subtle": "#2a2a4a",
-    "border_default": "#3a3a5a",
-    "border_focus": "#4a9eff",
+    "bg_primary": "#0b1020",
+    "bg_secondary": "#11192d",
+    "bg_tertiary": "#1a2640",
+    "bg_surface": "#151e34",
+    "text_primary": "#f7f9ff",
+    "text_secondary": "#98a5c6",
+    "text_disabled": "#65708c",
+    "accent_primary": "#4b7fff",
+    "accent_hover": "#6ee0ff",
+    "accent_pressed": "#385ecc",
+    "status_success": "#56c89a",
+    "status_warning": "#f2c55c",
+    "status_error": "#f0839a",
+    "status_info": "#78c9ff",
+    "border_subtle": "#24314e",
+    "border_default": "#2a3858",
+    "border_focus": "#6dd7ff",
 }
 
 TYPOGRAPHY: Final[dict[str, object]] = {
-    "font_family": "Segoe UI, Inter, -apple-system, sans-serif",
+    "font_family": '"Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif',
     "font_size_xs": 11,
     "font_size_sm": 12,
     "font_size_md": 13,
-    "font_size_lg": 15,
-    "font_size_xl": 18,
-    "font_size_xxl": 22,
+    "font_size_lg": 16,
+    "font_size_xl": 20,
+    "font_size_xxl": 26,
     "font_weight_normal": 400,
-    "font_weight_medium": 500,
-    "font_weight_bold": 600,
+    "font_weight_medium": 600,
+    "font_weight_bold": 700,
 }
 
 SPACING: Final[dict[str, int]] = {
@@ -58,26 +58,43 @@ def _build_fallback_stylesheet() -> str:
     """Generate a readable dark stylesheet when the resource file is missing."""
     return f"""
 QWidget {{
-    background-color: {COLORS["bg_primary"]};
     color: {COLORS["text_primary"]};
     font-family: {TYPOGRAPHY["font_family"]};
     font-size: {TYPOGRAPHY["font_size_md"]}pt;
 }}
 
-QMainWindow, QFrame {{
+QMainWindow {{
     background-color: {COLORS["bg_primary"]};
 }}
 
-QFrame#AppBar,
+QFrame#AppBar {{
+    background-color: {COLORS["bg_secondary"]};
+    border-bottom: 1px solid {COLORS["border_subtle"]};
+}}
+
 QFrame#NavRail,
 QFrame#InspectorPanel,
-QStatusBar {{
+QFrame#PageHero,
+QFrame#InfoCard,
+QGroupBox,
+QFrame#ImportIntakeCard,
+QFrame#rowInspector,
+QStatusBar,
+QFrame#InspectorPlaceholder {{
     background-color: {COLORS["bg_secondary"]};
     border: 1px solid {COLORS["border_subtle"]};
+    border-radius: 18px;
 }}
 
 QLabel {{
     color: {COLORS["text_primary"]};
+}}
+
+QLabel#AppTitle,
+QLabel#pageHeading,
+QLabel#inspectorHeading {{
+    font-size: {TYPOGRAPHY["font_size_xxl"]}pt;
+    font-weight: {TYPOGRAPHY["font_weight_bold"]};
 }}
 
 QLabel[muted="true"] {{
@@ -89,7 +106,7 @@ QToolButton {{
     background-color: {COLORS["bg_surface"]};
     color: {COLORS["text_primary"]};
     border: 1px solid {COLORS["border_default"]};
-    border-radius: 8px;
+    border-radius: 14px;
     padding: {SPACING["sm"]}px {SPACING["md"]}px;
 }}
 
@@ -113,32 +130,35 @@ QComboBox {{
     background-color: {COLORS["bg_surface"]};
     color: {COLORS["text_primary"]};
     border: 1px solid {COLORS["border_default"]};
-    border-radius: 8px;
+    border-radius: 14px;
     padding: {SPACING["sm"]}px;
     selection-background-color: {COLORS["accent_primary"]};
 }}
 
 QTableView,
 QTreeView,
-QListView {{
+QListView,
+QTableWidget {{
     background-color: {COLORS["bg_secondary"]};
     alternate-background-color: {COLORS["bg_surface"]};
     color: {COLORS["text_primary"]};
     gridline-color: {COLORS["border_subtle"]};
     selection-background-color: {COLORS["accent_primary"]};
     selection-color: {COLORS["text_primary"]};
+    border: 1px solid {COLORS["border_subtle"]};
+    border-radius: 18px;
 }}
 
 QProgressBar {{
     background-color: {COLORS["bg_surface"]};
     border: 1px solid {COLORS["border_default"]};
-    border-radius: 8px;
+    border-radius: 10px;
     text-align: center;
 }}
 
 QProgressBar::chunk {{
     background-color: {COLORS["accent_primary"]};
-    border-radius: 8px;
+    border-radius: 10px;
 }}
 """.strip()
 

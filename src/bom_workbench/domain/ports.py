@@ -9,7 +9,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel
 
-from .entities import BomProject, BomRow, Job
+from .entities import BomProject, BomRow, Job, ProviderConfig
 from .enums import JobState
 
 __all__ = [
@@ -21,6 +21,7 @@ __all__ = [
     "IEvidenceRetriever",
     "IExporter",
     "IJobRepository",
+    "IProviderConfigRepository",
     "IProviderAdapter",
     "ISecretStore",
     "ModelInfo",
@@ -82,6 +83,9 @@ class ProviderResponse:
     latency_ms: float = 0.0
     success: bool = True
     error_message: str = ""
+    status_code: int | None = None
+    retry_after_seconds: float | None = None
+    error_category: str = ""
 
 
 @dataclass(slots=True)
@@ -195,6 +199,19 @@ class IJobRepository(Protocol):
     async def list_by_project(self, project_id: int) -> list[Job]: ...
 
     async def list_recent(self, limit: int = 50) -> list[Job]: ...
+
+
+@runtime_checkable
+class IProviderConfigRepository(Protocol):
+    """Persistence port for provider runtime settings."""
+
+    async def save(self, config: ProviderConfig) -> ProviderConfig: ...
+
+    async def get_by_provider(self, provider_name: str) -> ProviderConfig | None: ...
+
+    async def list_all(self) -> list[ProviderConfig]: ...
+
+    async def list_enabled(self) -> list[ProviderConfig]: ...
 
 
 @runtime_checkable

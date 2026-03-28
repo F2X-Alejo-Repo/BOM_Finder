@@ -78,3 +78,37 @@ async def test_procurement_export_can_skip_metadata_sheet(tmp_path: Path) -> Non
 
     assert workbook.sheetnames == ["BOM"]
     assert result.sheets_created == ["BOM"]
+
+
+@pytest.mark.anyio
+async def test_full_table_export_strips_illegal_worksheet_characters(tmp_path: Path) -> None:
+    output_path = tmp_path / "full_table.xlsx"
+    exporter = XlsxExporter()
+    rows = [
+        BomRow(
+            project_id=1,
+            source_file="sample\x00.csv",
+            designator="F1",
+            comment="16V 100A 40m\x00 1812 PTC Resettable Fuses RoHS",
+            category="Protection\x0bDevices",
+            lcsc_part_number="C99999",
+        )
+    ]
+
+    result = await exporter.export_full_table(
+        rows,
+        output_path,
+        ExportOptions(include_metadata_sheet=True),
+    )
+
+    workbook = load_workbook(output_path, data_only=False)
+    sheet = workbook["Full Table"]
+    headers = [sheet.cell(row=1, column=index).value for index in range(1, sheet.max_column + 1)]
+    comment_column = headers.index("comment") + 1
+    category_column = headers.index("category") + 1
+
+    assert result.sheets_created == ["Full Table", "Metadata"]
+    assert sheet.cell(row=2, column=comment_column).value == "16V 100A 40m 1812 PTC Resettable Fuses RoHS"
+    assert sheet.cell(row=2, column=category_column).value == "ProtectionDevices"
+    assert workbook["Metadata"]["B5"].value == "sample.csv"
+    assert any("illegal worksheet characters removed" in warning for warning in result.warnings)

@@ -53,17 +53,6 @@ class DropZone(QFrame):
 
     def _set_active(self, active: bool) -> None:
         self.setProperty("active", active)
-        border_color = "#2563eb" if active else "#cbd5e1"
-        background = "#eff6ff" if active else "#f8fafc"
-        self.setStyleSheet(
-            "QFrame#dropZone {"
-            "border:2px dashed "
-            f"{border_color};"
-            "border-radius:12px;"
-            f"background:{background};"
-            "color:#334155;"
-            "}"
-        )
         self.style().unpolish(self)
         self.style().polish(self)
         self.update()

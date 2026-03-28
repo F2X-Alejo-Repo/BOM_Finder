@@ -33,6 +33,7 @@ def test_providers_page_contract(monkeypatch: pytest.MonkeyPatch) -> None:
 
     page.set_provider_models("openai", ["gpt-4.1-mini", "gpt-5"])
     page.set_provider_models("anthropic", ["claude-sonnet-4", "claude-haiku-4"])
+    page.set_provider_api_key("openai", "sk-detected")
     page.set_connection_status_text("openai", "Connected")
     page.apply_provider_capabilities(
         "anthropic",
@@ -41,6 +42,7 @@ def test_providers_page_contract(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert openai_card.model.count() == 2
     assert openai_card.model.itemText(0) == "gpt-4.1-mini"
+    assert openai_card.api_key.text() == "sk-detected"
     assert openai_card.connection_status_value.text() == "Connected"
     assert anthropic_card.reasoning_group.isHidden()
 
@@ -69,3 +71,34 @@ def test_providers_page_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     assert payload["openai"]["api_key"] == "openai-key"
     assert payload["anthropic"]["api_key"] == "anthropic-key"
     assert payload["openai"]["selected_model"] == "gpt-4.1-mini"
+
+    page.hydrate_provider_settings(
+        "openai",
+        {
+            "provider": "openai",
+            "enabled": False,
+            "selected_model": "gpt-5",
+            "reasoning_mode": "Medium",
+            "cached_models": ["gpt-4.1-mini", "gpt-5"],
+            "timeout_seconds": 90,
+            "max_retries": 4,
+            "max_concurrent": 2,
+            "temperature": 0.2,
+            "privacy_level": "minimal",
+            "manual_approval": True,
+            "auth_method": "api_key",
+            "extra_config": {"profile": "prod"},
+        },
+    )
+
+    hydrated_payload = page.provider_settings()["openai"]
+    assert openai_card.enabled.isChecked() is False
+    assert openai_card.model.currentText() == "gpt-5"
+    assert openai_card.reasoning_mode.currentText() == "Medium"
+    assert hydrated_payload["selected_model"] == "gpt-5"
+    assert hydrated_payload["reasoning_mode"] == "Medium"
+    assert hydrated_payload["cached_models"] == ["gpt-4.1-mini", "gpt-5"]
+    assert hydrated_payload["runtime_defaults"]["timeout_seconds"] == 90
+    assert hydrated_payload["runtime_defaults"]["max_retries"] == 4
+    assert hydrated_payload["runtime_defaults"]["max_concurrent"] == 2
+    assert hydrated_payload["runtime_defaults"]["manual_approval"] is True

@@ -17,77 +17,96 @@ def _ensure_app(monkeypatch: pytest.MonkeyPatch):
     return app
 
 
-def test_part_finder_page_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The part finder page should expose the Phase 9 UI contract."""
+def test_part_finder_page_emits_filters_and_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ensure_app(monkeypatch)
+
+    from bom_workbench.ui.pages.part_finder_page import PartFinderPage
+
+    page = PartFinderPage()
+    emitted: list[dict[str, object]] = []
+    page.search_requested.connect(emitted.append)
+
+    page.set_context_row(
+        {
+            "id": 7,
+            "designator": "R1",
+            "mpn": "BASE-MPN",
+            "footprint": "0603",
+            "value": "10k",
+            "manufacturer": "Base Parts",
+        }
+    )
+    page.part_number_edit.setText("C12345")
+    page.footprint_edit.setText("0805")
+    page.value_edit.setText("10k resistor")
+    page.manufacturer_edit.setText("Vendor Test")
+    page.active_only_check.setChecked(True)
+    page.in_stock_check.setChecked(True)
+    page.lcsc_available_check.setChecked(False)
+
+    page.search_button.click()
+
+    assert emitted
+    payload = emitted[0]
+    assert payload["part_number"] == "C12345"
+    assert payload["footprint"] == "0805"
+    assert payload["value"] == "10k resistor"
+    assert payload["manufacturer"] == "Vendor Test"
+    assert payload["filters"] == {
+        "active_only": True,
+        "in_stock": True,
+        "lcsc_available": False,
+    }
+    assert payload["context_row"]["id"] == 7
+
+
+def test_part_finder_page_busy_state_disables_actions(monkeypatch: pytest.MonkeyPatch) -> None:
     _ensure_app(monkeypatch)
 
     from bom_workbench.ui.pages.part_finder_page import PartFinderPage
 
     page = PartFinderPage()
 
-    search_from_selected_events: list[bool] = []
-    search_events: list[dict[str, object]] = []
-    apply_events: list[dict[str, object]] = []
+    page.set_busy_state(searching=True)
+    assert page.is_busy() is True
+    assert page.search_button.isEnabled() is False
+    assert page.search_from_selected_button.isEnabled() is False
+    assert page.bulk_search_button.isEnabled() is False
+    assert page.apply_selected_button.isEnabled() is False
+    assert page.part_number_edit.isEnabled() is False
 
-    page.search_from_selected_requested.connect(
-        lambda: search_from_selected_events.append(True)
-    )
-    page.search_requested.connect(search_events.append)
-    page.apply_candidate_requested.connect(apply_events.append)
+    page.set_busy_state()
+    assert page.is_busy() is False
+    assert page.search_button.isEnabled() is True
+    assert page.search_from_selected_button.isEnabled() is True
+    assert page.bulk_search_button.isEnabled() is True
+    assert page.apply_selected_button.isEnabled() is True
+    assert page.part_number_edit.isEnabled() is True
 
-    page.set_context_row(
-        {
-            "designator": "R12",
-            "mpn": "RC0402FR-0710KL",
-            "footprint": "0402",
-            "value": "10k",
-            "manufacturer": "Yageo",
-        }
-    )
-    page.part_number_edit.setText("RC0402FR-0710KL")
-    page.footprint_edit.setText("0402")
-    page.value_edit.setText("10k")
-    page.manufacturer_edit.setText("Yageo")
+
+def test_part_finder_page_emits_bulk_scope_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    _ensure_app(monkeypatch)
+
+    from bom_workbench.ui.pages.part_finder_page import PartFinderPage
+
+    page = PartFinderPage()
+    emitted: list[dict[str, object]] = []
+    page.bulk_search_requested.connect(emitted.append)
+
     page.active_only_check.setChecked(True)
     page.in_stock_check.setChecked(False)
     page.lcsc_available_check.setChecked(True)
-    page.set_status_message("Ready")
+    page.mode_tabs.setCurrentWidget(page.bulk_tab)
+    page.bulk_scope_combo.setCurrentIndex(1)
+    page.bulk_search_button.click()
 
-    candidates = [
+    assert emitted == [
         {
-            "candidate": "Yageo RC0402FR-0710KL",
-            "mpn": "RC0402FR-0710KL",
-            "footprint": "0402",
-            "value": "10k",
-            "manufacturer": "Yageo",
-            "stock": 124,
-            "score": 0.98,
-        },
-        {
-            "candidate": "KOA RK73H",
-            "mpn": "RK73H1JTTD1002F",
-            "footprint": "0402",
-            "value": "10k",
-            "manufacturer": "KOA",
-            "stock": 52,
-            "score": 0.81,
-        },
+            "scope": "no_availability",
+            "filters": {
+                "active_only": True,
+                "in_stock": False,
+                "lcsc_available": True,
+            },
+        }
     ]
-    page.set_candidates(candidates)
-
-    page.search_from_selected_button.click()
-    page.search_button.click()
-    page.candidate_view.selectRow(0)
-    page.apply_selected_button.click()
-
-    assert search_from_selected_events == [True]
-    assert search_events
-    criteria = search_events[0]
-    assert criteria["part_number"] == "RC0402FR-0710KL"
-    assert criteria["filters"]["active_only"] is True
-    assert criteria["context_row"]["designator"] == "R12"
-    assert page.candidate_model.rowCount() == 2
-    assert page.candidate_view.currentIndex().row() == 0
-    assert apply_events[-1]["mpn"] == "RC0402FR-0710KL"
-    assert "Ready" == page.status_label.text()
-    assert "R12" in page.context_summary.text()

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from .event_bus import (
     EventBus,
+    ImportCompleted,
+    ImportFailed,
+    ImportPreviewReady,
+    ImportStarted,
     JobCancelled,
     JobCompleted,
     JobFailed,
@@ -12,12 +16,14 @@ from .event_bus import (
     JobQueued,
     JobResumed,
     JobStarted,
-    ImportCompleted,
-    ImportFailed,
-    ImportPreviewReady,
-    ImportStarted,
 )
-from .enrichment import BomEnrichmentUseCase, EvidenceParseResult, SearchKeyResolution
+from .enrichment import (
+    BomEnrichmentUseCase,
+    EnrichmentExecutionResult,
+    EnrichmentExecutionTelemetry,
+    EvidenceParseResult,
+    SearchKeyResolution,
+)
 from .export_bom import ExportBomUseCase
 from .find_parts import (
     FindPartsUseCase,
@@ -26,8 +32,31 @@ from .find_parts import (
     ReplacementConfirmationRequired,
     ReplacementSearchResult,
 )
-from .job_manager import JobManager
 from .import_bom import ImportBomUseCase, ImportPreview, ImportResult
+from .job_manager import JobManager, RowExecutionResult
+from .llm_enrichment import (
+    GroundedLLMEnrichmentStage,
+    GroundedLLMResponseSchema,
+    LLMEnrichmentOutcome,
+    LLMEnrichmentPatch,
+    LLMEnrichmentRequest,
+    LLMStage,
+    LlmEnrichmentPayload,
+    LlmEnrichmentStage,
+    LlmStageResult,
+    ProviderBackedLlmEnrichmentStage,
+    StructuredEnrichmentPatch,
+    build_grounded_llm_enrichment_stage,
+)
+from .provider_management import (
+    ProviderAdapterRegistration,
+    ProviderManagementService,
+    ProviderState,
+)
+from .provider_runtime_config import (
+    ProviderRuntimeConfigService,
+    ProviderRuntimeConfigSnapshot,
+)
 from .state_machine import (
     ROW_STATE_TRANSITIONS,
     RowStateTransition,
@@ -35,17 +64,31 @@ from .state_machine import (
     transition_row_state,
     validate_row_state_transition,
 )
-from .provider_management import (
-    ProviderAdapterRegistration,
-    ProviderManagementService,
-    ProviderState,
-)
 
 __all__ = [
     "EventBus",
     "BomEnrichmentUseCase",
     "ExportBomUseCase",
     "FindPartsUseCase",
+    "ImportBomUseCase",
+    "ImportCompleted",
+    "ImportFailed",
+    "ImportPreview",
+    "ImportPreviewReady",
+    "ImportResult",
+    "ImportStarted",
+    "EnrichmentExecutionResult",
+    "EnrichmentExecutionTelemetry",
+    "EvidenceParseResult",
+    "GroundedLLMEnrichmentStage",
+    "GroundedLLMResponseSchema",
+    "LLMEnrichmentOutcome",
+    "LLMEnrichmentPatch",
+    "LLMEnrichmentRequest",
+    "LLMStage",
+    "LlmEnrichmentPayload",
+    "LlmEnrichmentStage",
+    "LlmStageResult",
     "JobCancelled",
     "JobCompleted",
     "JobFailed",
@@ -55,24 +98,22 @@ __all__ = [
     "JobQueued",
     "JobResumed",
     "JobStarted",
-    "ImportBomUseCase",
-    "ImportCompleted",
-    "ImportFailed",
-    "ImportPreview",
-    "ImportPreviewReady",
-    "ImportResult",
-    "ImportStarted",
-    "EvidenceParseResult",
+    "RowExecutionResult",
     "PartSearchCriteria",
-    "ROW_STATE_TRANSITIONS",
     "ProviderAdapterRegistration",
     "ProviderManagementService",
+    "ProviderRuntimeConfigService",
+    "ProviderRuntimeConfigSnapshot",
+    "ProviderBackedLlmEnrichmentStage",
     "ProviderState",
+    "ROW_STATE_TRANSITIONS",
     "ReplacementApplicationResult",
     "ReplacementConfirmationRequired",
     "ReplacementSearchResult",
     "RowStateTransition",
     "SearchKeyResolution",
+    "StructuredEnrichmentPatch",
+    "build_grounded_llm_enrichment_stage",
     "normalize_row_state",
     "transition_row_state",
     "validate_row_state_transition",

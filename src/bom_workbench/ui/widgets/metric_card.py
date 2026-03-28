@@ -22,6 +22,7 @@ class MetricCard(QFrame):
         self._title = QLabel(title, self)
         self._value = QLabel(value, self)
         self._subtitle = QLabel(subtitle, self)
+        self.setProperty("card", True)
 
         self._title.setObjectName("metricCardTitle")
         self._value.setObjectName("metricCardValue")
@@ -33,17 +34,6 @@ class MetricCard(QFrame):
         layout.addWidget(self._title)
         layout.addWidget(self._value)
         layout.addWidget(self._subtitle)
-
-        self.setStyleSheet(
-            "QFrame#metricCard {"
-            "background:#ffffff;"
-            "border:1px solid #dbe4f0;"
-            "border-radius:12px;"
-            "}"
-            "QLabel#metricCardTitle {color:#64748b;font-size:12px;font-weight:600;}"
-            "QLabel#metricCardValue {color:#0f172a;font-size:24px;font-weight:700;}"
-            "QLabel#metricCardSubtitle {color:#475569;font-size:12px;}"
-        )
 
     def set_title(self, title: str) -> None:
         self._title.setText(title)
