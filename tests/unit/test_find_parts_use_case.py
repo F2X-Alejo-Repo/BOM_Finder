@@ -9,7 +9,9 @@ import pytest
 
 from bom_workbench.application.find_parts import (
     FindPartsUseCase,
+    PartFinderLLMSearchResponseSchema,
     PartSearchCriteria,
+    PartFinderLLMResponseSchema,
     ReplacementConfirmationRequired,
 )
 from bom_workbench.domain.entities import BomRow
@@ -293,6 +295,247 @@ async def test_find_candidates_applies_requested_filters() -> None:
     )
 
     assert [result.candidate.mpn for result in results] == ["GOOD-1"]
+
+
+@pytest.mark.anyio
+async def test_find_candidates_applies_constraint_preferences() -> None:
+    row = _make_row(
+        id=8,
+        mpn="CAP-100N",
+        manufacturer="YAGEO",
+        footprint="Capacitor_SMD:C_0603_1608Metric",
+        package="0603",
+        comment="100nF",
+    )
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "MATCH-1",
+                "footprint": "0603",
+                "package": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 2500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+            {
+                "manufacturer": "KEMET",
+                "mpn": "WRONG-MANUFACTURER",
+                "footprint": "0603",
+                "package": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 2500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "WRONG-FOOTPRINT",
+                "footprint": "0805",
+                "package": "0805",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 2500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "LOW-STOCK",
+                "footprint": "0603",
+                "package": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 25,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        row_id=8,
+        criteria=PartSearchCriteria(
+            keep_same_footprint=True,
+            keep_same_manufacturer=True,
+            minimum_stock_qty=100,
+        ),
+    )
+
+    assert [result.candidate.mpn for result in results] == ["MATCH-1"]
+
+
+@pytest.mark.anyio
+async def test_find_candidates_prefers_high_availability() -> None:
+    row = _make_row(id=9, comment="100nF capacitor", footprint="0603")
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Alpha Parts",
+                "mpn": "LOW-QTY",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 150,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+            {
+                "manufacturer": "Beta Parts",
+                "mpn": "HIGH-QTY",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 250000,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        row_id=9,
+        criteria=PartSearchCriteria(prefer_high_availability=True),
+    )
+
+    assert results[0].candidate.mpn == "HIGH-QTY"
+    assert "Availability preference bonus applied" in results[0].explanation
+
+
+@pytest.mark.anyio
+async def test_find_candidates_applies_grounded_llm_rerank() -> None:
+    row = _make_row(id=10, comment="100nF capacitor", footprint="0603")
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Alpha Parts",
+                "mpn": "ALPHA-1",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+            {
+                "manufacturer": "Beta Parts",
+                "mpn": "BETA-1",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            },
+        ]
+    )
+
+    async def fake_llm_stage(row, criteria, candidates):  # noqa: ANN001
+        assert row.id == 10
+        assert criteria.keep_same_footprint is True
+        assert len(candidates) == 2
+        return PartFinderLLMResponseSchema(
+            ranked_candidates=[
+                {
+                    "candidate_id": "candidate_1",
+                    "keep": True,
+                    "adjusted_score": 0.30,
+                    "rationale": "Acceptable fallback.",
+                },
+                {
+                    "candidate_id": "candidate_2",
+                    "keep": True,
+                    "adjusted_score": 0.98,
+                    "rationale": "Best supply profile and fit.",
+                },
+            ],
+            summary="Prefer candidate_2.",
+        )
+
+    use_case = FindPartsUseCase(
+        FakeRepository([row]),
+        FakeRetriever([evidence]),
+        llm_stage=fake_llm_stage,
+    )
+
+    results = await use_case.find_candidates(
+        row_id=10,
+        criteria=PartSearchCriteria(keep_same_footprint=True),
+    )
+
+    assert results[0].candidate.mpn == "BETA-1"
+    assert "LLM rerank" in results[0].explanation
+
+
+@pytest.mark.anyio
+async def test_find_candidates_expands_search_with_grounded_llm_leads() -> None:
+    row = _make_row(id=13, comment="100nF", footprint="0603", category="Capacitors/Ceramic Capacitors")
+
+    initial_evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Fallback Parts",
+                "mpn": "FALLBACK-1",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 50,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ]
+    )
+    expanded_evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "CC0603KRX7R9BB104",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 2314200,
+                "lifecycle_status": "active",
+                "confidence": "high",
+                "lcsc_part_number": "C14663",
+                "lcsc_link": "https://www.lcsc.com/product-detail/C14663.html",
+            }
+        ],
+        strategy="llm_search_lead",
+    )
+
+    class SearchAwareRetriever:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        async def retrieve(self, search_keys: object) -> list[RawEvidence]:
+            self.calls.append(search_keys)
+            if getattr(search_keys, "lcsc_part_number", "") == "C14663":
+                return [expanded_evidence]
+            return [initial_evidence]
+
+    async def fake_llm_search_stage(row, criteria, search_resolution, candidates):  # noqa: ANN001
+        assert row.id == 13
+        assert search_resolution.primary_field in {"comment", "footprint", "category"}
+        assert len(candidates) == 1
+        return PartFinderLLMSearchResponseSchema(
+            search_leads=[
+                {
+                    "lcsc_part_number": "C14663",
+                    "footprint": "0603",
+                    "category": "Capacitors/Ceramic Capacitors",
+                    "param_summary": "100nF capacitor",
+                    "rationale": "Known high-availability equivalent.",
+                }
+            ],
+            summary="Expand with one strong LCSC lead.",
+        )
+
+    retriever = SearchAwareRetriever()
+    use_case = FindPartsUseCase(
+        FakeRepository([row]),
+        retriever,
+        llm_search_stage=fake_llm_search_stage,
+    )
+
+    results = await use_case.find_candidates(row_id=13)
+
+    assert len(retriever.calls) == 2
+    assert results[0].candidate.lcsc_part_number == "C14663"
 
 
 @pytest.mark.anyio

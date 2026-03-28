@@ -104,6 +104,23 @@ class _CandidateTableModel(_BaseTableModel):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(self._columns, parent)
 
+    def _format_tooltip(self, row: Mapping[str, Any]) -> str:
+        parts = []
+        for label, field in self._columns:
+            value = row.get(field, "")
+            if value in ("", None):
+                continue
+            parts.append(f"{label}: {value}")
+        explanation = str(row.get("match_explanation", "")).strip()
+        if explanation:
+            parts.append(f"Explanation: {explanation}")
+        warnings = row.get("warnings", [])
+        if isinstance(warnings, Sequence) and not isinstance(warnings, (str, bytes)):
+            warning_lines = [str(item).strip() for item in warnings if str(item).strip()]
+            if warning_lines:
+                parts.append("Warnings: " + "; ".join(warning_lines))
+        return "\n".join(parts)
+
 
 class _TargetTableModel(_BaseTableModel):
     _columns: list[tuple[str, str]] = [
@@ -171,6 +188,33 @@ class PartFinderPage(SimplePage):
         filters_layout.addWidget(self.lcsc_available_check)
         filters_layout.addStretch(1)
 
+        strategy_card = QtWidgets.QGroupBox("Replacement Strategy", self)
+        strategy_layout = QtWidgets.QGridLayout(strategy_card)
+        strategy_layout.setContentsMargins(12, 12, 12, 12)
+        strategy_layout.setHorizontalSpacing(12)
+        strategy_layout.setVerticalSpacing(10)
+        self.keep_same_footprint_check = QtWidgets.QCheckBox(
+            "Keep same footprint/package",
+            strategy_card,
+        )
+        self.keep_same_manufacturer_check = QtWidgets.QCheckBox(
+            "Keep same manufacturer",
+            strategy_card,
+        )
+        self.prefer_high_availability_check = QtWidgets.QCheckBox(
+            "Prefer high availability",
+            strategy_card,
+        )
+        self.minimum_stock_qty_spin = QtWidgets.QSpinBox(strategy_card)
+        self.minimum_stock_qty_spin.setRange(0, 50_000_000)
+        self.minimum_stock_qty_spin.setSpecialValueText("Any")
+        self.minimum_stock_qty_spin.setSuffix(" pcs")
+        strategy_layout.addWidget(self.keep_same_footprint_check, 0, 0)
+        strategy_layout.addWidget(self.keep_same_manufacturer_check, 0, 1)
+        strategy_layout.addWidget(self.prefer_high_availability_check, 1, 0)
+        strategy_layout.addWidget(QtWidgets.QLabel("Minimum stock qty", strategy_card), 1, 1)
+        strategy_layout.addWidget(self.minimum_stock_qty_spin, 1, 2)
+
         candidates_group = QtWidgets.QGroupBox("Replacement Candidates", self)
         candidates_layout = QtWidgets.QVBoxLayout(candidates_group)
         self.candidate_model = _CandidateTableModel(self)
@@ -204,6 +248,7 @@ class PartFinderPage(SimplePage):
         self.content_layout.addWidget(self.context_summary)
         self.content_layout.addWidget(self.mode_tabs)
         self.content_layout.addWidget(filters_card)
+        self.content_layout.addWidget(strategy_card)
         self.content_layout.addWidget(candidates_group)
         self.content_layout.addLayout(action_row)
         self.content_layout.addWidget(self.status_label)
@@ -366,6 +411,15 @@ class PartFinderPage(SimplePage):
             "lcsc_available": self.lcsc_available_check.isChecked(),
         }
 
+    def current_preferences(self) -> dict[str, Any]:
+        minimum_stock_qty = int(self.minimum_stock_qty_spin.value())
+        return {
+            "keep_same_footprint": self.keep_same_footprint_check.isChecked(),
+            "keep_same_manufacturer": self.keep_same_manufacturer_check.isChecked(),
+            "prefer_high_availability": self.prefer_high_availability_check.isChecked(),
+            "minimum_stock_qty": minimum_stock_qty if minimum_stock_qty > 0 else 0,
+        }
+
     def set_busy_state(self, *, searching: bool = False, applying: bool = False) -> None:
         self._searching = searching
         self._applying = applying
@@ -382,6 +436,10 @@ class PartFinderPage(SimplePage):
         self.active_only_check.setEnabled(not busy)
         self.in_stock_check.setEnabled(not busy)
         self.lcsc_available_check.setEnabled(not busy)
+        self.keep_same_footprint_check.setEnabled(not busy)
+        self.keep_same_manufacturer_check.setEnabled(not busy)
+        self.prefer_high_availability_check.setEnabled(not busy)
+        self.minimum_stock_qty_spin.setEnabled(not busy)
         self.candidate_view.setEnabled(not busy)
         self.target_view.setEnabled(not busy)
         self.mode_tabs.setEnabled(not busy)
@@ -396,6 +454,7 @@ class PartFinderPage(SimplePage):
             "value": self.value_edit.text().strip(),
             "manufacturer": self.manufacturer_edit.text().strip(),
             "filters": self.current_filters(),
+            "preferences": self.current_preferences(),
             "context_row": dict(self._context_row) if self._context_row else None,
         }
         self.search_requested.emit(criteria)
@@ -405,6 +464,7 @@ class PartFinderPage(SimplePage):
             {
                 "scope": self.current_bulk_scope(),
                 "filters": self.current_filters(),
+                "preferences": self.current_preferences(),
             }
         )
 

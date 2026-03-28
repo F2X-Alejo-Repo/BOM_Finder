@@ -7,20 +7,32 @@ import re
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
+
+import structlog
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..domain.entities import BomRow
 from ..domain.enums import Confidence, EvidenceType, LifecycleStatus, ReplacementStatus
 from ..domain.matching import MatchingEngine
-from ..domain.ports import IBomRepository, IEvidenceRetriever, RawEvidence
+from ..domain.ports import (
+    ChatConfig,
+    IBomRepository,
+    IEvidenceRetriever,
+    ProviderResponse,
+    RawEvidence,
+)
 from ..domain.value_objects import EvidenceRecord, ReplacementCandidate, SearchKeys
 
 __all__ = [
     "FindPartsUseCase",
+    "GroundedPartFinderStage",
     "PartSearchCriteria",
     "ReplacementBatch",
     "ReplacementApplicationResult",
     "ReplacementConfirmationRequired",
+    "PartFinderLLMResponseSchema",
+    "build_grounded_part_finder_stage",
     "ReplacementSearchResult",
     "SearchKeyResolution",
 ]
@@ -38,6 +50,16 @@ _OUT_OF_STOCK_STATUSES = {
     "out_of_stock",
     "unavailable",
 }
+_HIGH_AVAILABILITY_STATUSES = {
+    "high",
+    "in_stock",
+    "available",
+}
+_MAX_LLM_SEARCH_LEADS = 5
+_MAX_LLM_RERANK_CANDIDATES = 12
+_LLM_SCORE_BLEND = 0.35
+
+logger = structlog.get_logger(__name__)
 
 
 def _utc_epoch() -> datetime:
@@ -61,6 +83,10 @@ class PartSearchCriteria:
     active_only: bool = False
     in_stock: bool = False
     lcsc_available: bool = False
+    keep_same_footprint: bool = False
+    keep_same_manufacturer: bool = False
+    prefer_high_availability: bool = False
+    minimum_stock_qty: int | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -81,6 +107,871 @@ class ReplacementSearchResult:
     score: float
     explanation: str
     requires_manual_review: bool
+
+
+class PartFinderLLMDecisionSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    candidate_id: str
+    keep: bool = True
+    adjusted_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    rationale: str = ""
+
+
+class PartFinderLLMResponseSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    ranked_candidates: list[PartFinderLLMDecisionSchema] = Field(default_factory=list)
+    summary: str = ""
+
+
+class PartFinderLLMSearchLeadSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    part_number: str = ""
+    lcsc_part_number: str = ""
+    mpn: str = ""
+    footprint: str = ""
+    category: str = ""
+    param_summary: str = ""
+    manufacturer: str = ""
+    rationale: str = ""
+
+
+class PartFinderLLMSearchResponseSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    search_leads: list[PartFinderLLMSearchLeadSchema] = Field(default_factory=list)
+    summary: str = ""
+
+
+PartFinderLLMStage = Callable[
+    [BomRow, PartSearchCriteria, Sequence[ReplacementSearchResult]],
+    Awaitable[PartFinderLLMResponseSchema | None],
+]
+
+
+PartFinderLLMSearchStage = Callable[
+    [BomRow, PartSearchCriteria, SearchKeyResolution, Sequence[ReplacementCandidate]],
+    Awaitable[PartFinderLLMSearchResponseSchema | None],
+]
+
+
+class GroundedPartFinderSearchStage:
+    """Provider-backed grounded search planner for replacement candidate expansion."""
+
+    def __init__(
+        self,
+        provider_source: Any,
+        *,
+        api_key: str = "",
+        model: str = "",
+        timeout_seconds: int = 60,
+        max_tokens: int = 1200,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        allow_manual_approval: bool = False,
+        system_prompt: str = "",
+    ) -> None:
+        self._provider_source = provider_source
+        self._api_key = self._clean_text(api_key)
+        self._model = self._clean_text(model)
+        self._timeout_seconds = max(10, int(timeout_seconds or 60))
+        self._max_tokens = max(512, int(max_tokens or 1200))
+        self._temperature = temperature
+        self._reasoning_effort = self._clean_text(reasoning_effort)
+        self._allow_manual_approval = allow_manual_approval
+        self._system_prompt = self._build_system_prompt(system_prompt)
+
+    async def __call__(
+        self,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        search_resolution: SearchKeyResolution,
+        reference_candidates: Sequence[ReplacementCandidate],
+    ) -> PartFinderLLMSearchResponseSchema | None:
+        logger.info(
+            "part_finder_llm_search_stage_started",
+            row_id=int(row.id or 0),
+            project_id=int(row.project_id or 0),
+            primary_field=search_resolution.primary_field,
+            primary_value=search_resolution.primary_value,
+            reference_candidate_count=len(reference_candidates),
+            direct_adapter=self._is_direct_adapter(),
+        )
+        if self._is_direct_adapter():
+            return await self._run_with_adapter(
+                adapter=self._provider_source,
+                provider_name=self._clean_text(
+                    getattr(self._provider_source, "get_name", lambda: "")()
+                ),
+                api_key=self._api_key,
+                model=self._model,
+                row=row,
+                criteria=criteria,
+                search_resolution=search_resolution,
+                reference_candidates=reference_candidates,
+            )
+
+        runtimes = await self._list_runtimes()
+        if not runtimes:
+            return None
+
+        for runtime in runtimes:
+            if not self._allow_manual_approval and bool(getattr(runtime, "manual_approval", False)):
+                continue
+            provider_name = self._clean_text(getattr(runtime, "provider", ""))
+            model_name = self._clean_text(getattr(runtime, "model", ""))
+            api_key = self._clean_text(getattr(runtime, "api_key", ""))
+            if not provider_name or not model_name or not api_key:
+                continue
+            adapter = self._resolve_adapter(provider_name)
+            if adapter is None:
+                continue
+            response = await self._run_with_adapter(
+                adapter=adapter,
+                provider_name=provider_name,
+                api_key=api_key,
+                model=model_name,
+                row=row,
+                criteria=criteria,
+                search_resolution=search_resolution,
+                reference_candidates=reference_candidates,
+                runtime=runtime,
+            )
+            if response is not None:
+                return response
+        return None
+
+    async def _run_with_adapter(
+        self,
+        *,
+        adapter: Any,
+        provider_name: str,
+        api_key: str,
+        model: str,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        search_resolution: SearchKeyResolution,
+        reference_candidates: Sequence[ReplacementCandidate],
+        runtime: Any | None = None,
+    ) -> PartFinderLLMSearchResponseSchema | None:
+        if not provider_name:
+            provider_name = self._clean_text(getattr(adapter, "get_name", lambda: "")())
+        if not model and runtime is not None:
+            model = self._clean_text(getattr(runtime, "model", ""))
+        if not api_key and runtime is not None:
+            api_key = self._clean_text(getattr(runtime, "api_key", ""))
+        if not provider_name or not model or not api_key:
+            return None
+        if not hasattr(adapter, "chat_structured"):
+            return None
+
+        messages = self._build_messages(
+            row=row,
+            criteria=criteria,
+            search_resolution=search_resolution,
+            reference_candidates=reference_candidates,
+        )
+        config = self._build_chat_config(api_key=api_key, model=model, runtime=runtime)
+        logger.info(
+            "part_finder_llm_search_request_prepared",
+            row_id=int(row.id or 0),
+            provider=provider_name,
+            model=model,
+            criteria_payload=self._criteria_payload(criteria),
+            search_resolution={
+                "primary_field": search_resolution.primary_field,
+                "primary_value": search_resolution.primary_value,
+                "search_keys": search_resolution.search_keys.model_dump(mode="json"),
+            },
+            reference_candidates=self._reference_candidate_payloads(reference_candidates),
+            chat_config=self._chat_config_payload(config),
+        )
+
+        try:
+            response: ProviderResponse = await adapter.chat_structured(
+                messages,
+                PartFinderLLMSearchResponseSchema,
+                config,
+            )
+        except Exception as exc:  # pragma: no cover - service boundary
+            logger.exception(
+                "part_finder_llm_search_provider_exception",
+                row_id=int(row.id or 0),
+                provider=provider_name,
+                model=model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return None
+
+        logger.info(
+            "part_finder_llm_search_response_received",
+            row_id=int(row.id or 0),
+            provider=self._clean_text(response.provider) or provider_name,
+            model=self._clean_text(response.model) or model,
+            success=response.success,
+            latency_ms=response.latency_ms,
+            usage=dict(response.usage),
+            error_category=self._clean_text(response.error_category),
+            retry_after_seconds=response.retry_after_seconds,
+            response_content=self._clean_text(response.content),
+            raw_response=dict(response.raw_response),
+        )
+        if not response.success:
+            return None
+
+        try:
+            parsed = PartFinderLLMSearchResponseSchema.model_validate_json(response.content)
+        except Exception as exc:
+            logger.warning(
+                "part_finder_llm_search_validation_failed",
+                row_id=int(row.id or 0),
+                provider=self._clean_text(response.provider) or provider_name,
+                model=self._clean_text(response.model) or model,
+                error_type=type(exc).__name__,
+                response_content=self._clean_text(response.content),
+                raw_response=dict(response.raw_response),
+            )
+            return None
+
+        logger.info(
+            "part_finder_llm_search_plan_received",
+            row_id=int(row.id or 0),
+            provider=self._clean_text(response.provider) or provider_name,
+            model=self._clean_text(response.model) or model,
+            summary=parsed.summary,
+            search_leads=[lead.model_dump(mode="json") for lead in parsed.search_leads],
+        )
+        return parsed
+
+    async def _list_runtimes(self) -> list[Any]:
+        if not hasattr(self._provider_source, "list_enabled_runtime_configs"):
+            return []
+        runtimes = await self._provider_source.list_enabled_runtime_configs()
+        if not isinstance(runtimes, list):
+            return []
+        return list(runtimes)
+
+    def _resolve_adapter(self, provider_name: str) -> Any | None:
+        if not hasattr(self._provider_source, "get_adapter"):
+            return None
+        try:
+            return self._provider_source.get_adapter(provider_name)
+        except Exception:  # pragma: no cover - adapter lookup is a service boundary
+            return None
+
+    def _is_direct_adapter(self) -> bool:
+        return hasattr(self._provider_source, "chat_structured") and not hasattr(
+            self._provider_source,
+            "list_enabled_runtime_configs",
+        )
+
+    def _build_chat_config(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        runtime: Any | None = None,
+    ) -> ChatConfig:
+        if runtime is not None and hasattr(runtime, "to_chat_config"):
+            config = runtime.to_chat_config(
+                system_prompt=self._system_prompt,
+                max_tokens=self._max_tokens,
+            )
+            if self._temperature is not None:
+                config.temperature = self._temperature
+            if self._reasoning_effort:
+                config.reasoning_effort = self._reasoning_effort
+            if self._timeout_seconds:
+                config.timeout_seconds = self._timeout_seconds
+            config.api_key = api_key
+            config.model = model
+            config.response_format = "json_object"
+            return config
+
+        return ChatConfig(
+            api_key=api_key,
+            model=model,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            timeout_seconds=self._timeout_seconds,
+            reasoning_effort=self._reasoning_effort or None,
+            response_format="json_object",
+            system_prompt=self._system_prompt,
+        )
+
+    def _build_messages(
+        self,
+        *,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        search_resolution: SearchKeyResolution,
+        reference_candidates: Sequence[ReplacementCandidate],
+    ) -> list[dict[str, str]]:
+        payload = {
+            "purpose": "grounded_part_replacement_search_planning",
+            "instruction": (
+                "Use the supplied BOM row, explicit criteria, resolved search keys, and reference candidates "
+                "to propose additional search leads. These leads will be validated by deterministic supplier "
+                "lookup, so prefer exact MPNs or LCSC part numbers when possible."
+            ),
+            "row": self._row_payload(row),
+            "criteria": self._criteria_payload(criteria),
+            "search_resolution": {
+                "primary_field": search_resolution.primary_field,
+                "primary_value": search_resolution.primary_value,
+                "search_keys": search_resolution.search_keys.model_dump(mode="json"),
+            },
+            "reference_candidates": self._reference_candidate_payloads(reference_candidates),
+        }
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+            },
+        ]
+
+    def _row_payload(self, row: BomRow) -> dict[str, Any]:
+        return {
+            "row_id": int(row.id or 0),
+            "project_id": int(row.project_id or 0),
+            "designator": self._clean_text(row.designator),
+            "comment": self._clean_text(row.comment),
+            "value_raw": self._clean_text(row.value_raw),
+            "footprint": self._clean_text(row.footprint),
+            "package": self._clean_text(row.package),
+            "manufacturer": self._clean_text(row.manufacturer),
+            "mpn": self._clean_text(row.mpn),
+            "lcsc_part_number": self._clean_text(row.lcsc_part_number),
+            "category": self._clean_text(row.category),
+            "param_summary": self._clean_text(row.param_summary),
+            "quantity": int(row.quantity or 0),
+            "stock_qty": row.stock_qty,
+            "stock_status": self._clean_text(row.stock_status),
+            "lifecycle_status": self._clean_text(row.lifecycle_status),
+        }
+
+    def _criteria_payload(self, criteria: PartSearchCriteria) -> dict[str, Any]:
+        return {
+            "part_number": self._clean_text(criteria.part_number),
+            "lcsc_part_number": self._clean_text(criteria.lcsc_part_number),
+            "mpn": self._clean_text(criteria.mpn),
+            "source_url": self._clean_text(criteria.source_url),
+            "comment": self._clean_text(criteria.comment),
+            "value": self._clean_text(criteria.value),
+            "footprint": self._clean_text(criteria.footprint),
+            "category": self._clean_text(criteria.category),
+            "param_summary": self._clean_text(criteria.param_summary),
+            "manufacturer": self._clean_text(criteria.manufacturer),
+            "active_only": criteria.active_only,
+            "in_stock": criteria.in_stock,
+            "lcsc_available": criteria.lcsc_available,
+            "keep_same_footprint": criteria.keep_same_footprint,
+            "keep_same_manufacturer": criteria.keep_same_manufacturer,
+            "prefer_high_availability": criteria.prefer_high_availability,
+            "minimum_stock_qty": criteria.minimum_stock_qty,
+        }
+
+    def _reference_candidate_payloads(
+        self,
+        candidates: Sequence[ReplacementCandidate],
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for candidate in candidates[:3]:
+            payloads.append(
+                {
+                    "manufacturer": self._clean_text(candidate.manufacturer),
+                    "mpn": self._clean_text(candidate.mpn),
+                    "part_number": self._clean_text(candidate.part_number),
+                    "lcsc_part_number": self._clean_text(candidate.lcsc_part_number),
+                    "footprint": self._clean_text(candidate.footprint),
+                    "package": self._clean_text(candidate.package),
+                    "value_summary": self._clean_text(candidate.value_summary),
+                    "description": self._clean_text(candidate.description),
+                    "stock_qty": candidate.stock_qty,
+                    "stock_status": self._clean_text(candidate.stock_status),
+                    "lifecycle_status": self._clean_text(candidate.lifecycle_status),
+                    "lcsc_link": self._clean_text(candidate.lcsc_link),
+                }
+            )
+        return payloads
+
+    def _chat_config_payload(self, config: ChatConfig) -> dict[str, Any]:
+        return {
+            "api_key": config.api_key,
+            "model": config.model,
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+            "timeout_seconds": config.timeout_seconds,
+            "reasoning_effort": config.reasoning_effort,
+            "response_format": config.response_format,
+            "system_prompt": config.system_prompt,
+        }
+
+    def _build_system_prompt(self, extra_prompt: str) -> str:
+        parts = [
+            "You are a grounded part replacement search planner.",
+            "Use only the supplied BOM row, explicit criteria, resolved search keys, and reference candidates.",
+            "Generate search leads, not final replacement claims.",
+            "Treat keep_same_footprint, keep_same_manufacturer, and minimum_stock_qty as hard constraints.",
+            "Prefer exact MPNs or LCSC part numbers that are likely broadly available on LCSC.",
+            "If you are uncertain, return fewer leads instead of inventing options.",
+            "Return at most 5 leads and only data that matches the schema.",
+        ]
+        if extra_prompt.strip():
+            parts.append(extra_prompt.strip())
+        return "\n\n".join(parts)
+
+    def _clean_text(self, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+
+class GroundedPartFinderStage:
+    """Provider-backed grounded reranker for deterministic replacement candidates."""
+
+    def __init__(
+        self,
+        provider_source: Any,
+        *,
+        api_key: str = "",
+        model: str = "",
+        timeout_seconds: int = 60,
+        max_tokens: int = 1400,
+        temperature: float | None = None,
+        reasoning_effort: str | None = None,
+        allow_manual_approval: bool = False,
+        system_prompt: str = "",
+    ) -> None:
+        self._provider_source = provider_source
+        self._api_key = self._clean_text(api_key)
+        self._model = self._clean_text(model)
+        self._timeout_seconds = max(10, int(timeout_seconds or 60))
+        self._max_tokens = max(512, int(max_tokens or 1400))
+        self._temperature = temperature
+        self._reasoning_effort = self._clean_text(reasoning_effort)
+        self._allow_manual_approval = allow_manual_approval
+        self._system_prompt = self._build_system_prompt(system_prompt)
+
+    async def __call__(
+        self,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        candidates: Sequence[ReplacementSearchResult],
+    ) -> PartFinderLLMResponseSchema | None:
+        if len(candidates) < 2:
+            return None
+        logger.info(
+            "part_finder_llm_stage_started",
+            row_id=int(row.id or 0),
+            project_id=int(row.project_id or 0),
+            candidate_count=len(candidates),
+            direct_adapter=self._is_direct_adapter(),
+            keep_same_footprint=criteria.keep_same_footprint,
+            keep_same_manufacturer=criteria.keep_same_manufacturer,
+            prefer_high_availability=criteria.prefer_high_availability,
+            minimum_stock_qty=criteria.minimum_stock_qty,
+        )
+        if self._is_direct_adapter():
+            return await self._run_with_adapter(
+                adapter=self._provider_source,
+                provider_name=self._clean_text(getattr(self._provider_source, "get_name", lambda: "")()),
+                api_key=self._api_key,
+                model=self._model,
+                row=row,
+                criteria=criteria,
+                candidates=candidates,
+            )
+
+        runtimes = await self._list_runtimes()
+        if not runtimes:
+            return None
+
+        for runtime in runtimes:
+            if not self._allow_manual_approval and bool(getattr(runtime, "manual_approval", False)):
+                continue
+            provider_name = self._clean_text(getattr(runtime, "provider", ""))
+            model_name = self._clean_text(getattr(runtime, "model", ""))
+            api_key = self._clean_text(getattr(runtime, "api_key", ""))
+            if not provider_name or not model_name or not api_key:
+                continue
+            adapter = self._resolve_adapter(provider_name)
+            if adapter is None:
+                continue
+            response = await self._run_with_adapter(
+                adapter=adapter,
+                provider_name=provider_name,
+                api_key=api_key,
+                model=model_name,
+                row=row,
+                criteria=criteria,
+                candidates=candidates,
+                runtime=runtime,
+            )
+            if response is not None:
+                return response
+        return None
+
+    async def _run_with_adapter(
+        self,
+        *,
+        adapter: Any,
+        provider_name: str,
+        api_key: str,
+        model: str,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        candidates: Sequence[ReplacementSearchResult],
+        runtime: Any | None = None,
+    ) -> PartFinderLLMResponseSchema | None:
+        if not provider_name:
+            provider_name = self._clean_text(getattr(adapter, "get_name", lambda: "")())
+        if not model and runtime is not None:
+            model = self._clean_text(getattr(runtime, "model", ""))
+        if not api_key and runtime is not None:
+            api_key = self._clean_text(getattr(runtime, "api_key", ""))
+        if not provider_name or not model or not api_key:
+            return None
+        if not hasattr(adapter, "chat_structured"):
+            return None
+
+        messages = self._build_messages(row=row, criteria=criteria, candidates=candidates)
+        config = self._build_chat_config(api_key=api_key, model=model, runtime=runtime)
+        logger.info(
+            "part_finder_llm_request_prepared",
+            row_id=int(row.id or 0),
+            provider=provider_name,
+            model=model,
+            candidate_count=len(candidates),
+            criteria_payload=self._criteria_payload(criteria),
+            candidate_payloads=self._candidate_payloads(candidates),
+            chat_config=self._chat_config_payload(config),
+        )
+
+        try:
+            response: ProviderResponse = await adapter.chat_structured(
+                messages,
+                PartFinderLLMResponseSchema,
+                config,
+            )
+        except Exception as exc:  # pragma: no cover - service boundary
+            logger.exception(
+                "part_finder_llm_provider_exception",
+                row_id=int(row.id or 0),
+                provider=provider_name,
+                model=model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return None
+
+        logger.info(
+            "part_finder_llm_provider_response_received",
+            row_id=int(row.id or 0),
+            provider=self._clean_text(response.provider) or provider_name,
+            model=self._clean_text(response.model) or model,
+            success=response.success,
+            latency_ms=response.latency_ms,
+            usage=dict(response.usage),
+            error_category=self._clean_text(response.error_category),
+            retry_after_seconds=response.retry_after_seconds,
+            response_content=self._clean_text(response.content),
+            raw_response=dict(response.raw_response),
+        )
+        if not response.success:
+            logger.warning(
+                "part_finder_llm_provider_response_failed",
+                row_id=int(row.id or 0),
+                provider=self._clean_text(response.provider) or provider_name,
+                model=self._clean_text(response.model) or model,
+                error_message=self._clean_text(response.error_message),
+                raw_response=dict(response.raw_response),
+            )
+            return None
+
+        try:
+            parsed = PartFinderLLMResponseSchema.model_validate_json(response.content)
+        except Exception as exc:
+            logger.warning(
+                "part_finder_llm_response_validation_failed",
+                row_id=int(row.id or 0),
+                provider=self._clean_text(response.provider) or provider_name,
+                model=self._clean_text(response.model) or model,
+                error_type=type(exc).__name__,
+                response_content=self._clean_text(response.content),
+                raw_response=dict(response.raw_response),
+            )
+            return None
+
+        logger.info(
+            "part_finder_llm_response_parsed",
+            row_id=int(row.id or 0),
+            provider=self._clean_text(response.provider) or provider_name,
+            model=self._clean_text(response.model) or model,
+            summary=parsed.summary,
+            ranked_candidates=[decision.model_dump(mode="json") for decision in parsed.ranked_candidates],
+        )
+        return parsed
+
+    async def _list_runtimes(self) -> list[Any]:
+        if not hasattr(self._provider_source, "list_enabled_runtime_configs"):
+            return []
+        runtimes = await self._provider_source.list_enabled_runtime_configs()
+        if not isinstance(runtimes, list):
+            return []
+        return list(runtimes)
+
+    def _resolve_adapter(self, provider_name: str) -> Any | None:
+        if not hasattr(self._provider_source, "get_adapter"):
+            return None
+        try:
+            return self._provider_source.get_adapter(provider_name)
+        except Exception:  # pragma: no cover - adapter lookup is a service boundary
+            return None
+
+    def _is_direct_adapter(self) -> bool:
+        return hasattr(self._provider_source, "chat_structured") and not hasattr(
+            self._provider_source,
+            "list_enabled_runtime_configs",
+        )
+
+    def _build_chat_config(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        runtime: Any | None = None,
+    ) -> ChatConfig:
+        if runtime is not None and hasattr(runtime, "to_chat_config"):
+            config = runtime.to_chat_config(
+                system_prompt=self._system_prompt,
+                max_tokens=self._max_tokens,
+            )
+            if self._temperature is not None:
+                config.temperature = self._temperature
+            if self._reasoning_effort:
+                config.reasoning_effort = self._reasoning_effort
+            if self._timeout_seconds:
+                config.timeout_seconds = self._timeout_seconds
+            config.api_key = api_key
+            config.model = model
+            config.response_format = "json_object"
+            return config
+
+        return ChatConfig(
+            api_key=api_key,
+            model=model,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            timeout_seconds=self._timeout_seconds,
+            reasoning_effort=self._reasoning_effort or None,
+            response_format="json_object",
+            system_prompt=self._system_prompt,
+        )
+
+    def _build_messages(
+        self,
+        *,
+        row: BomRow,
+        criteria: PartSearchCriteria,
+        candidates: Sequence[ReplacementSearchResult],
+    ) -> list[dict[str, str]]:
+        payload = {
+            "purpose": "grounded_part_replacement_ranking",
+            "instruction": (
+                "Use only the supplied BOM row, explicit criteria, and deterministic candidates. "
+                "Do not invent supplier data or candidate identifiers."
+            ),
+            "row": self._row_payload(row),
+            "criteria": self._criteria_payload(criteria),
+            "candidates": self._candidate_payloads(candidates),
+        }
+        return [
+            {"role": "system", "content": self._system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                ),
+            },
+        ]
+
+    def _row_payload(self, row: BomRow) -> dict[str, Any]:
+        return {
+            "row_id": int(row.id or 0),
+            "project_id": int(row.project_id or 0),
+            "designator": self._clean_text(row.designator),
+            "comment": self._clean_text(row.comment),
+            "value_raw": self._clean_text(row.value_raw),
+            "footprint": self._clean_text(row.footprint),
+            "package": self._clean_text(row.package),
+            "manufacturer": self._clean_text(row.manufacturer),
+            "mpn": self._clean_text(row.mpn),
+            "lcsc_part_number": self._clean_text(row.lcsc_part_number),
+            "category": self._clean_text(row.category),
+            "param_summary": self._clean_text(row.param_summary),
+            "quantity": int(row.quantity or 0),
+            "stock_qty": row.stock_qty,
+            "stock_status": self._clean_text(row.stock_status),
+            "lifecycle_status": self._clean_text(row.lifecycle_status),
+        }
+
+    def _criteria_payload(self, criteria: PartSearchCriteria) -> dict[str, Any]:
+        return {
+            "part_number": self._clean_text(criteria.part_number),
+            "lcsc_part_number": self._clean_text(criteria.lcsc_part_number),
+            "mpn": self._clean_text(criteria.mpn),
+            "source_url": self._clean_text(criteria.source_url),
+            "comment": self._clean_text(criteria.comment),
+            "value": self._clean_text(criteria.value),
+            "footprint": self._clean_text(criteria.footprint),
+            "category": self._clean_text(criteria.category),
+            "param_summary": self._clean_text(criteria.param_summary),
+            "manufacturer": self._clean_text(criteria.manufacturer),
+            "active_only": criteria.active_only,
+            "in_stock": criteria.in_stock,
+            "lcsc_available": criteria.lcsc_available,
+            "keep_same_footprint": criteria.keep_same_footprint,
+            "keep_same_manufacturer": criteria.keep_same_manufacturer,
+            "prefer_high_availability": criteria.prefer_high_availability,
+            "minimum_stock_qty": criteria.minimum_stock_qty,
+        }
+
+    def _candidate_payloads(
+        self,
+        candidates: Sequence[ReplacementSearchResult],
+    ) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for index, result in enumerate(candidates, start=1):
+            candidate = result.candidate
+            payloads.append(
+                {
+                    "candidate_id": self._candidate_id(index),
+                    "manufacturer": self._clean_text(candidate.manufacturer),
+                    "mpn": self._clean_text(candidate.mpn),
+                    "part_number": self._clean_text(candidate.part_number),
+                    "lcsc_part_number": self._clean_text(candidate.lcsc_part_number),
+                    "footprint": self._clean_text(candidate.footprint),
+                    "package": self._clean_text(candidate.package),
+                    "value_summary": self._clean_text(candidate.value_summary),
+                    "description": self._clean_text(candidate.description),
+                    "stock_qty": candidate.stock_qty,
+                    "stock_status": self._clean_text(candidate.stock_status),
+                    "lifecycle_status": self._clean_text(candidate.lifecycle_status),
+                    "confidence": self._clean_text(
+                        candidate.confidence.value
+                        if hasattr(candidate.confidence, "value")
+                        else candidate.confidence
+                    ),
+                    "match_score": float(result.score),
+                    "match_explanation": self._clean_text(result.explanation),
+                    "requires_manual_review": bool(result.requires_manual_review),
+                    "warnings": list(candidate.warnings),
+                    "lcsc_link": self._clean_text(candidate.lcsc_link),
+                }
+            )
+        return payloads
+
+    def _chat_config_payload(self, config: ChatConfig) -> dict[str, Any]:
+        return {
+            "api_key": config.api_key,
+            "model": config.model,
+            "temperature": config.temperature,
+            "max_tokens": config.max_tokens,
+            "timeout_seconds": config.timeout_seconds,
+            "reasoning_effort": config.reasoning_effort,
+            "response_format": config.response_format,
+            "system_prompt": config.system_prompt,
+        }
+
+    def _build_system_prompt(self, extra_prompt: str) -> str:
+        parts = [
+            "You are a grounded part replacement ranking assistant.",
+            "Use only the supplied BOM row, explicit criteria, and deterministic candidate list.",
+            "Never invent candidate identifiers, stock data, lifecycle data, or package data.",
+            "Treat keep_same_footprint, keep_same_manufacturer, and minimum_stock_qty as hard constraints.",
+            "Prefer candidates with stronger availability, healthy lifecycle, and better deterministic match quality.",
+            "Return only data that matches the schema.",
+        ]
+        if extra_prompt.strip():
+            parts.append(extra_prompt.strip())
+        return "\n\n".join(parts)
+
+    def _candidate_id(self, index: int) -> str:
+        return f"candidate_{index}"
+
+    def _clean_text(self, value: object) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+
+def build_grounded_part_finder_stage(
+    provider_source: Any,
+    *,
+    api_key: str = "",
+    model: str = "",
+    timeout_seconds: int = 60,
+    max_tokens: int = 1400,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+    allow_manual_approval: bool = False,
+    system_prompt: str = "",
+) -> GroundedPartFinderStage:
+    """Build a grounded LLM reranker for replacement candidates."""
+
+    return GroundedPartFinderStage(
+        provider_source,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        allow_manual_approval=allow_manual_approval,
+        system_prompt=system_prompt,
+    )
+
+
+def build_grounded_part_finder_search_stage(
+    provider_source: Any,
+    *,
+    api_key: str = "",
+    model: str = "",
+    timeout_seconds: int = 60,
+    max_tokens: int = 1200,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+    allow_manual_approval: bool = False,
+    system_prompt: str = "",
+) -> GroundedPartFinderSearchStage:
+    """Build a grounded LLM search planner for replacement candidate expansion."""
+
+    return GroundedPartFinderSearchStage(
+        provider_source,
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout_seconds,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        allow_manual_approval=allow_manual_approval,
+        system_prompt=system_prompt,
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -127,11 +1018,15 @@ class FindPartsUseCase:
         *,
         matching_engine: MatchingEngine | None = None,
         manual_review_threshold: float = _DEFAULT_REVIEW_THRESHOLD,
+        llm_search_stage: PartFinderLLMSearchStage | None = None,
+        llm_stage: PartFinderLLMStage | None = None,
     ) -> None:
         self._repository = repository
         self._retriever = retriever
         self._matching_engine = matching_engine or MatchingEngine()
         self._manual_review_threshold = manual_review_threshold
+        self._llm_search_stage = llm_search_stage
+        self._llm_stage = llm_stage
 
     async def find_candidates_for_row(self, row_id: int) -> list[ReplacementSearchResult]:
         """Convenience wrapper for row-driven searches."""
@@ -149,13 +1044,23 @@ class FindPartsUseCase:
         if row_id is None and criteria is None:
             raise ValueError("Either row_id or criteria must be provided.")
 
-        criteria_data = self._coerce_criteria(criteria)
+        criteria_model = self._coerce_criteria_model(criteria)
+        criteria_data = self._coerce_criteria(criteria_model)
         context_row = await self._resolve_context_row(row_id=row_id, criteria=criteria)
         search_resolution = self.resolve_search_keys(context_row, criteria=criteria)
         if not search_resolution.primary_value:
             return []
 
-        evidence = await self._retriever.retrieve(search_resolution.search_keys)
+        evidence = list(await self._retriever.retrieve(search_resolution.search_keys))
+        initial_candidates = self._parse_candidates(evidence)
+        if self._llm_search_stage is not None:
+            evidence = await self._expand_evidence_with_llm(
+                context_row,
+                criteria_model,
+                search_resolution,
+                evidence,
+                initial_candidates,
+            )
         candidates = self._parse_candidates(evidence)
         if not candidates:
             return []
@@ -163,23 +1068,36 @@ class FindPartsUseCase:
         scored_candidates = self._matching_engine.rank_candidates(context_row, candidates)
         results: list[ReplacementSearchResult] = []
         for candidate, score in scored_candidates:
+            score_value = score.total
+            explanation = score.explanation
+            if criteria_model.prefer_high_availability:
+                score_value, explanation = self._apply_availability_preference(
+                    candidate,
+                    score_value,
+                    explanation,
+                )
             ranked_candidate = candidate.model_copy(
                 update={
-                    "match_score": score.total,
-                    "match_explanation": score.explanation,
+                    "match_score": score_value,
+                    "match_explanation": explanation,
                 }
             )
-            if not self._candidate_matches_filters(ranked_candidate, criteria_data):
+            if not self._candidate_matches_filters(ranked_candidate, criteria_model, context_row):
                 continue
             results.append(
                 ReplacementSearchResult(
                     candidate=ranked_candidate,
-                    score=score.total,
-                    explanation=score.explanation,
-                    requires_manual_review=self._requires_manual_review(ranked_candidate, score.total),
+                    score=score_value,
+                    explanation=explanation,
+                    requires_manual_review=self._requires_manual_review(
+                        ranked_candidate,
+                        score_value,
+                    ),
                 )
             )
-        return results
+        if self._llm_stage is not None and len(results) > 1:
+            results = await self._rerank_with_llm(context_row, criteria_model, results)
+        return self._sort_results(results)
 
     async def apply_replacement(
         self,
@@ -588,22 +1506,338 @@ class FindPartsUseCase:
             return True
         return self._normalize_stock_status(candidate.stock_status) in _OUT_OF_STOCK_STATUSES
 
+    async def _expand_evidence_with_llm(
+        self,
+        context_row: BomRow,
+        criteria: PartSearchCriteria,
+        search_resolution: SearchKeyResolution,
+        evidence: Sequence[RawEvidence],
+        initial_candidates: Sequence[ReplacementCandidate],
+    ) -> list[RawEvidence]:
+        try:
+            response = await self._llm_search_stage(
+                context_row,
+                criteria,
+                search_resolution,
+                tuple(initial_candidates),
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            logger.exception(
+                "part_finder_llm_search_stage_failed",
+                row_id=int(context_row.id or 0),
+                project_id=int(context_row.project_id or 0),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return list(evidence)
+
+        if response is None or not response.search_leads:
+            return list(evidence)
+
+        merged_evidence = list(evidence)
+        seen_keys = {
+            self._search_keys_fingerprint(search_resolution.search_keys),
+        }
+        logger.info(
+            "part_finder_llm_search_expansion_started",
+            row_id=int(context_row.id or 0),
+            project_id=int(context_row.project_id or 0),
+            lead_count=len(response.search_leads),
+            summary=response.summary,
+        )
+        for lead in response.search_leads[:_MAX_LLM_SEARCH_LEADS]:
+            search_keys = self._search_keys_from_llm_lead(lead, context_row, criteria)
+            fingerprint = self._search_keys_fingerprint(search_keys)
+            if not fingerprint or fingerprint in seen_keys:
+                continue
+            seen_keys.add(fingerprint)
+            try:
+                extra_evidence = await self._retriever.retrieve(search_keys)
+            except Exception as exc:  # pragma: no cover - defensive boundary
+                logger.exception(
+                    "part_finder_llm_search_retrieve_failed",
+                    row_id=int(context_row.id or 0),
+                    project_id=int(context_row.project_id or 0),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    search_keys=search_keys.model_dump(mode="json"),
+                )
+                continue
+            if not extra_evidence:
+                continue
+            logger.info(
+                "part_finder_llm_search_retrieve_succeeded",
+                row_id=int(context_row.id or 0),
+                project_id=int(context_row.project_id or 0),
+                search_keys=search_keys.model_dump(mode="json"),
+                evidence_count=len(extra_evidence),
+                rationale=self._clean_text(lead.rationale),
+            )
+            merged_evidence.extend(extra_evidence)
+        return merged_evidence
+
+    def _search_keys_from_llm_lead(
+        self,
+        lead: PartFinderLLMSearchLeadSchema,
+        context_row: BomRow,
+        criteria: PartSearchCriteria,
+    ) -> SearchKeys:
+        lead_part_number = self._clean_text(lead.part_number)
+        lead_lcsc = self._first_non_empty(
+            lead.lcsc_part_number,
+            lead_part_number if self._looks_like_lcsc_part_number(lead_part_number) else "",
+        )
+        lead_mpn = self._first_non_empty(
+            lead.mpn,
+            "" if lead_lcsc else lead_part_number,
+        )
+        return SearchKeys(
+            lcsc_part_number=lead_lcsc,
+            mpn=lead_mpn,
+            source_url="",
+            comment=self._first_non_empty(
+                criteria.comment,
+                criteria.value,
+                context_row.comment,
+                context_row.value_raw,
+            ),
+            footprint=self._first_non_empty(
+                lead.footprint,
+                criteria.footprint,
+                context_row.footprint,
+                context_row.package,
+            ),
+            category=self._first_non_empty(
+                lead.category,
+                criteria.category,
+                context_row.category,
+            ),
+            param_summary=self._first_non_empty(
+                lead.param_summary,
+                criteria.param_summary,
+                context_row.param_summary,
+                criteria.value,
+                context_row.comment,
+                context_row.value_raw,
+            ),
+        )
+
+    def _search_keys_fingerprint(self, search_keys: SearchKeys) -> str:
+        if not any(
+            self._clean_text(value)
+            for value in (
+                search_keys.lcsc_part_number,
+                search_keys.mpn,
+                search_keys.source_url,
+                search_keys.comment,
+                search_keys.footprint,
+                search_keys.category,
+                search_keys.param_summary,
+            )
+        ):
+            return ""
+        return json.dumps(
+            search_keys.model_dump(mode="json"),
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
     def _candidate_matches_filters(
         self,
         candidate: ReplacementCandidate,
-        criteria: Mapping[str, Any],
+        criteria: PartSearchCriteria,
+        context_row: BomRow,
     ) -> bool:
-        if self._criteria_flag(criteria, "active_only") and self._is_risky_lifecycle(
-            candidate.lifecycle_status
-        ):
+        if criteria.active_only and self._is_risky_lifecycle(candidate.lifecycle_status):
             return False
-        if self._criteria_flag(criteria, "in_stock") and self._is_out_of_stock(candidate):
+        if criteria.in_stock and self._is_out_of_stock(candidate):
             return False
-        if self._criteria_flag(criteria, "lcsc_available") and not self._candidate_has_lcsc_availability(
-            candidate
+        if criteria.lcsc_available and not self._candidate_has_lcsc_availability(candidate):
+            return False
+        if criteria.minimum_stock_qty is not None:
+            if candidate.stock_qty is None or candidate.stock_qty < criteria.minimum_stock_qty:
+                return False
+        if criteria.keep_same_footprint and not self._matches_same_footprint(context_row, candidate):
+            return False
+        if criteria.keep_same_manufacturer and not self._matches_same_manufacturer(
+            context_row,
+            candidate,
         ):
             return False
         return True
+
+    async def _rerank_with_llm(
+        self,
+        context_row: BomRow,
+        criteria: PartSearchCriteria,
+        results: list[ReplacementSearchResult],
+    ) -> list[ReplacementSearchResult]:
+        llm_scope = list(results[:_MAX_LLM_RERANK_CANDIDATES])
+        untouched = list(results[_MAX_LLM_RERANK_CANDIDATES:])
+        try:
+            response = await self._llm_stage(context_row, criteria, tuple(llm_scope))
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            logger.exception(
+                "part_finder_llm_stage_failed",
+                row_id=int(context_row.id or 0),
+                project_id=int(context_row.project_id or 0),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return results
+
+        if response is None or not response.ranked_candidates:
+            return results
+
+        logger.info(
+            "part_finder_llm_rerank_received",
+            row_id=int(context_row.id or 0),
+            project_id=int(context_row.project_id or 0),
+            candidate_count=len(llm_scope),
+            decision_count=len(response.ranked_candidates),
+            summary=response.summary,
+        )
+        decisions = {
+            self._normalize_key(decision.candidate_id): decision
+            for decision in response.ranked_candidates
+            if self._clean_text(decision.candidate_id)
+        }
+        reranked: list[ReplacementSearchResult] = []
+        for index, result in enumerate(llm_scope, start=1):
+            decision = decisions.get(self._normalize_key(f"candidate_{index}"))
+            if decision is not None and not decision.keep:
+                continue
+            if decision is None:
+                reranked.append(result)
+                continue
+            score_value = self._blend_llm_score(result.score, decision.adjusted_score)
+            explanation = result.explanation
+            rationale = self._clean_text(decision.rationale)
+            if rationale:
+                explanation = f"{result.explanation} LLM rerank: {rationale}"
+            candidate = result.candidate.model_copy(
+                update={
+                    "match_score": score_value,
+                    "match_explanation": explanation,
+                }
+            )
+            reranked.append(
+                ReplacementSearchResult(
+                    candidate=candidate,
+                    score=score_value,
+                    explanation=explanation,
+                    requires_manual_review=self._requires_manual_review(candidate, score_value),
+                )
+            )
+        return self._sort_results([*reranked, *untouched])
+
+    def _sort_results(
+        self,
+        results: Sequence[ReplacementSearchResult],
+    ) -> list[ReplacementSearchResult]:
+        return sorted(
+            list(results),
+            key=lambda result: (
+                -float(result.score),
+                self._normalize_key(result.candidate.lcsc_part_number),
+                self._normalize_key(result.candidate.part_number),
+                self._normalize_key(result.candidate.mpn),
+            ),
+        )
+
+    def _apply_availability_preference(
+        self,
+        candidate: ReplacementCandidate,
+        score: float,
+        explanation: str,
+    ) -> tuple[float, str]:
+        bonus = self._availability_preference_bonus(candidate)
+        if bonus <= 0.0:
+            return score, explanation
+        updated = min(1.0, round(score + bonus, 6))
+        return updated, f"{explanation} Availability preference bonus applied (+{bonus:.3f})."
+
+    def _availability_preference_bonus(self, candidate: ReplacementCandidate) -> float:
+        if self._is_out_of_stock(candidate):
+            return 0.0
+        bonus = 0.0
+        stock_qty = candidate.stock_qty
+        if stock_qty is not None and stock_qty > 0:
+            if stock_qty >= 1_000_000:
+                bonus += 0.10
+            elif stock_qty >= 100_000:
+                bonus += 0.08
+            elif stock_qty >= 10_000:
+                bonus += 0.06
+            elif stock_qty >= 1_000:
+                bonus += 0.04
+            elif stock_qty >= 100:
+                bonus += 0.02
+        stock_status = self._normalize_stock_status(candidate.stock_status)
+        if stock_status == "high":
+            bonus += 0.03
+        elif stock_status == "medium":
+            bonus += 0.02
+        elif stock_status == "low":
+            bonus += 0.01
+        if candidate.confidence == Confidence.HIGH:
+            bonus += 0.01
+        return min(0.12, round(bonus, 6))
+
+    def _matches_same_footprint(
+        self,
+        context_row: BomRow,
+        candidate: ReplacementCandidate,
+    ) -> bool:
+        context_values = self._footprint_constraint_tokens(
+            context_row.footprint,
+            context_row.package,
+        )
+        candidate_values = self._footprint_constraint_tokens(
+            candidate.footprint,
+            candidate.package,
+            candidate.description,
+        )
+        if not context_values:
+            return True
+        if not candidate_values:
+            return False
+        return not context_values.isdisjoint(candidate_values)
+
+    def _matches_same_manufacturer(
+        self,
+        context_row: BomRow,
+        candidate: ReplacementCandidate,
+    ) -> bool:
+        expected = self._normalize_key(context_row.manufacturer)
+        if not expected:
+            return True
+        return self._normalize_key(candidate.manufacturer) == expected
+
+    def _footprint_constraint_tokens(self, *values: object) -> set[str]:
+        text = " ".join(self._clean_text(value) for value in values if self._clean_text(value))
+        if not text:
+            return set()
+        normalized = self._normalize_key(text)
+        tokens = {
+            match.group(0)
+            for match in re.finditer(r"\b[a-z]{2,8}-?\d{1,4}\b|\b\d{4}\b", normalized)
+        }
+        if not tokens and normalized:
+            tokens.add(normalized)
+        if any(size in normalized for size in ("0402", "0603", "0805", "1206", "1210", "1812", "2010", "2512")):
+            for size in ("0402", "0603", "0805", "1206", "1210", "1812", "2010", "2512"):
+                if size in normalized:
+                    tokens.add(size)
+        return tokens
+
+    def _blend_llm_score(self, base_score: float, adjusted_score: float) -> float:
+        llm_score = float(adjusted_score or 0.0)
+        if llm_score <= 0.0:
+            return base_score
+        blended = (base_score * (1.0 - _LLM_SCORE_BLEND)) + (llm_score * _LLM_SCORE_BLEND)
+        return max(0.0, min(1.0, round(blended, 6)))
 
     def _apply_candidate_to_row(self, row: BomRow, candidate: ReplacementCandidate) -> None:
         row.replacement_candidate_part_number = self._first_non_empty(
@@ -684,12 +1918,7 @@ class FindPartsUseCase:
         self,
         criteria: PartSearchCriteria | Mapping[str, Any] | None,
     ) -> dict[str, Any]:
-        if criteria is None:
-            return {}
-        if isinstance(criteria, PartSearchCriteria):
-            data = asdict(criteria)
-        else:
-            data = dict(criteria)
+        data = asdict(self._coerce_criteria_model(criteria))
 
         normalized: dict[str, Any] = {}
         for key, value in data.items():
@@ -702,6 +1931,44 @@ class FindPartsUseCase:
                 continue
             normalized[self._normalize_key(key)] = self._clean_text(value)
         return normalized
+
+    def _coerce_criteria_model(
+        self,
+        criteria: PartSearchCriteria | Mapping[str, Any] | None,
+    ) -> PartSearchCriteria:
+        if criteria is None:
+            return PartSearchCriteria()
+        if isinstance(criteria, PartSearchCriteria):
+            return criteria
+
+        raw = dict(criteria)
+        integer_value: int | None = None
+        minimum_stock_qty = raw.get("minimum_stock_qty")
+        if isinstance(minimum_stock_qty, int):
+            integer_value = minimum_stock_qty if minimum_stock_qty > 0 else None
+        elif isinstance(minimum_stock_qty, str) and minimum_stock_qty.strip().isdigit():
+            parsed = int(minimum_stock_qty.strip())
+            integer_value = parsed if parsed > 0 else None
+
+        return PartSearchCriteria(
+            part_number=self._clean_text(raw.get("part_number", "")),
+            lcsc_part_number=self._clean_text(raw.get("lcsc_part_number", "")),
+            mpn=self._clean_text(raw.get("mpn", "")),
+            source_url=self._clean_text(raw.get("source_url", "")),
+            comment=self._clean_text(raw.get("comment", "")),
+            value=self._clean_text(raw.get("value", "")),
+            footprint=self._clean_text(raw.get("footprint", "")),
+            category=self._clean_text(raw.get("category", "")),
+            param_summary=self._clean_text(raw.get("param_summary", "")),
+            manufacturer=self._clean_text(raw.get("manufacturer", "")),
+            active_only=self._criteria_flag(raw, "active_only"),
+            in_stock=self._criteria_flag(raw, "in_stock"),
+            lcsc_available=self._criteria_flag(raw, "lcsc_available"),
+            keep_same_footprint=self._criteria_flag(raw, "keep_same_footprint"),
+            keep_same_manufacturer=self._criteria_flag(raw, "keep_same_manufacturer"),
+            prefer_high_availability=self._criteria_flag(raw, "prefer_high_availability"),
+            minimum_stock_qty=integer_value,
+        )
 
     def _criteria_flag(self, criteria: Mapping[str, Any], key: str) -> bool:
         value = criteria.get(self._normalize_key(key), False)

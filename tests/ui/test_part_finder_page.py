@@ -43,6 +43,10 @@ def test_part_finder_page_emits_filters_and_context(monkeypatch: pytest.MonkeyPa
     page.active_only_check.setChecked(True)
     page.in_stock_check.setChecked(True)
     page.lcsc_available_check.setChecked(False)
+    page.keep_same_footprint_check.setChecked(True)
+    page.keep_same_manufacturer_check.setChecked(False)
+    page.prefer_high_availability_check.setChecked(True)
+    page.minimum_stock_qty_spin.setValue(500)
 
     page.search_button.click()
 
@@ -56,6 +60,12 @@ def test_part_finder_page_emits_filters_and_context(monkeypatch: pytest.MonkeyPa
         "active_only": True,
         "in_stock": True,
         "lcsc_available": False,
+    }
+    assert payload["preferences"] == {
+        "keep_same_footprint": True,
+        "keep_same_manufacturer": False,
+        "prefer_high_availability": True,
+        "minimum_stock_qty": 500,
     }
     assert payload["context_row"]["id"] == 7
 
@@ -74,6 +84,8 @@ def test_part_finder_page_busy_state_disables_actions(monkeypatch: pytest.Monkey
     assert page.bulk_search_button.isEnabled() is False
     assert page.apply_selected_button.isEnabled() is False
     assert page.part_number_edit.isEnabled() is False
+    assert page.keep_same_footprint_check.isEnabled() is False
+    assert page.minimum_stock_qty_spin.isEnabled() is False
 
     page.set_busy_state()
     assert page.is_busy() is False
@@ -82,6 +94,8 @@ def test_part_finder_page_busy_state_disables_actions(monkeypatch: pytest.Monkey
     assert page.bulk_search_button.isEnabled() is True
     assert page.apply_selected_button.isEnabled() is True
     assert page.part_number_edit.isEnabled() is True
+    assert page.keep_same_footprint_check.isEnabled() is True
+    assert page.minimum_stock_qty_spin.isEnabled() is True
 
 
 def test_part_finder_page_emits_bulk_scope_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -96,6 +110,10 @@ def test_part_finder_page_emits_bulk_scope_request(monkeypatch: pytest.MonkeyPat
     page.active_only_check.setChecked(True)
     page.in_stock_check.setChecked(False)
     page.lcsc_available_check.setChecked(True)
+    page.keep_same_footprint_check.setChecked(True)
+    page.keep_same_manufacturer_check.setChecked(True)
+    page.prefer_high_availability_check.setChecked(True)
+    page.minimum_stock_qty_spin.setValue(1000)
     page.mode_tabs.setCurrentWidget(page.bulk_tab)
     page.bulk_scope_combo.setCurrentIndex(1)
     page.bulk_search_button.click()
@@ -107,6 +125,12 @@ def test_part_finder_page_emits_bulk_scope_request(monkeypatch: pytest.MonkeyPat
                 "active_only": True,
                 "in_stock": False,
                 "lcsc_available": True,
+            },
+            "preferences": {
+                "keep_same_footprint": True,
+                "keep_same_manufacturer": True,
+                "prefer_high_availability": True,
+                "minimum_stock_qty": 1000,
             },
         }
     ]

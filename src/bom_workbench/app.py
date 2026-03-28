@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import UTC, datetime
 import inspect
 import json
 import os
@@ -37,6 +38,10 @@ from bom_workbench.application import (
     ImportStarted,
     ProviderManagementService,
 )
+from bom_workbench.application.find_parts import (
+    build_grounded_part_finder_search_stage,
+    build_grounded_part_finder_stage,
+)
 from bom_workbench.application.llm_enrichment import (
     LLMEnrichmentRequest,
     LLMStage,
@@ -59,6 +64,7 @@ from bom_workbench.infrastructure.persistence import (
     create_db_and_tables,
     create_engine_from_settings,
     create_session_factory,
+    get_default_database_path,
 )
 from bom_workbench.infrastructure.persistence.bom_repository import SqliteBomRepository
 from bom_workbench.infrastructure.persistence.job_repository import SqliteJobRepository
@@ -118,6 +124,10 @@ _OPENAI_TIER1_MODEL_LIMITS: dict[str, dict[str, int]] = {
 }
 _ENRICHMENT_REQUEST_TOKEN_BUDGET = 12_000
 _ENRICHMENT_REQUEST_SECONDS = 5
+_SESSION_CHECKPOINT_FILE_NAME = "bom_workbench.session.json"
+_INTERRUPTED_ENRICHMENT_MESSAGE = (
+    "Restored after app restart while enrichment had not completed."
+)
 
 
 def _schedule_async(awaitable: Any) -> Any:
@@ -128,6 +138,75 @@ def _schedule_async(awaitable: Any) -> Any:
     except RuntimeError:
         return asyncio.run(awaitable)
     return loop.create_task(awaitable)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _resolve_session_checkpoint_path(settings: DatabaseSettings | None = None) -> Path:
+    """Resolve the on-disk session checkpoint file path."""
+
+    database_path = get_default_database_path(settings or DatabaseSettings())
+    return database_path.parent / _SESSION_CHECKPOINT_FILE_NAME
+
+
+def _load_session_checkpoint(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _save_session_checkpoint(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(dict(payload), indent=2, sort_keys=True)
+    path.write_text(serialized, encoding="utf-8")
+
+
+def _checkpoint_int(payload: Mapping[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _select_restore_project_id(
+    checkpoint: Mapping[str, Any],
+    projects: Sequence[Any],
+) -> int | None:
+    checkpoint_project_id = _checkpoint_int(checkpoint, "project_id")
+    if checkpoint_project_id is not None:
+        for project in projects:
+            project_id = getattr(project, "id", None)
+            if isinstance(project_id, int) and project_id == checkpoint_project_id:
+                return project_id
+
+    latest_project_id: int | None = None
+    for project in projects:
+        project_id = getattr(project, "id", None)
+        if isinstance(project_id, int) and project_id > 0:
+            latest_project_id = project_id
+    return latest_project_id
+
+
+def _merge_restart_warning(existing: str, message: str) -> str:
+    warnings: list[str]
+    try:
+        loaded = json.loads(existing) if existing.strip() else []
+    except json.JSONDecodeError:
+        loaded = []
+    if isinstance(loaded, list):
+        warnings = [str(item).strip() for item in loaded if str(item).strip()]
+    else:
+        warnings = []
+    if message not in warnings:
+        warnings.append(message)
+    return json.dumps(warnings, ensure_ascii=True, separators=(",", ":"))
 
 
 def _provider_api_key_env_names(provider: str) -> tuple[str, ...]:
@@ -432,9 +511,64 @@ def _resolve_llm_stage(
     return grounded_llm_stage
 
 
+def _resolve_part_finder_llm_stage(provider_service: Any):
+    """Resolve an optional provider-backed grounded Part Finder reranking stage."""
+
+    if not isinstance(provider_service, ProviderManagementService):
+        return None
+
+    async def grounded_part_finder_stage(row: BomRow, criteria, candidates):
+        for runtime in await provider_service.list_enabled_runtime_configs():
+            if runtime.manual_approval:
+                continue
+            stage = build_grounded_part_finder_stage(
+                provider_service.get_adapter(runtime.provider),
+                api_key=runtime.api_key,
+                model=runtime.model,
+                timeout_seconds=runtime.timeout_seconds,
+                temperature=runtime.temperature,
+                reasoning_effort=runtime.reasoning_effort,
+                max_tokens=1400,
+            )
+            response = await stage(row, criteria, candidates)
+            if response is not None:
+                return response
+        return None
+
+    return grounded_part_finder_stage
+
+
+def _resolve_part_finder_llm_search_stage(provider_service: Any):
+    """Resolve an optional provider-backed grounded Part Finder search planner."""
+
+    if not isinstance(provider_service, ProviderManagementService):
+        return None
+
+    async def grounded_part_finder_search_stage(row: BomRow, criteria, search_resolution, candidates):
+        for runtime in await provider_service.list_enabled_runtime_configs():
+            if runtime.manual_approval:
+                continue
+            stage = build_grounded_part_finder_search_stage(
+                provider_service.get_adapter(runtime.provider),
+                api_key=runtime.api_key,
+                model=runtime.model,
+                timeout_seconds=runtime.timeout_seconds,
+                temperature=runtime.temperature,
+                reasoning_effort=runtime.reasoning_effort,
+                max_tokens=1200,
+            )
+            response = await stage(row, criteria, search_resolution, candidates)
+            if response is not None:
+                return response
+        return None
+
+    return grounded_part_finder_search_stage
+
+
 def _wire_phase6_import_flow(window: MainWindow) -> None:
     import_logger = logger.bind(flow="import")
     db_settings = DatabaseSettings.from_env()
+    checkpoint_path = _resolve_session_checkpoint_path(db_settings)
     engine = create_engine_from_settings(db_settings)
     create_db_and_tables(engine)
     session_factory = create_session_factory(engine)
@@ -454,7 +588,39 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
     import_page = import_page_widget if isinstance(import_page_widget, ImportPage) else None
     bom_table_page = bom_table_widget if isinstance(bom_table_widget, BomTablePage) else None
     row_inspector = window.inspector if isinstance(window.inspector, RowInspector) else None
-    state: dict[str, Any] = {"rows": [], "project_id": 0, "active_job_id": 0}
+    state: dict[str, Any] = {
+        "rows": [],
+        "project_id": 0,
+        "active_job_id": 0,
+        "selected_row_id": 0,
+        "checkpoint_path": str(checkpoint_path),
+    }
+
+    def _persist_session_checkpoint() -> None:
+        _save_session_checkpoint(
+            checkpoint_path,
+            {
+                "project_id": int(state.get("project_id", 0) or 0),
+                "project_name": str(state.get("project_name", "") or ""),
+                "selected_row_id": int(state.get("selected_row_id", 0) or 0),
+            },
+        )
+
+    def _select_bom_table_row(row_id: int | None) -> None:
+        if bom_table_page is None:
+            return
+        if row_id is None or row_id <= 0:
+            if bom_table_page.table_model.rowCount() > 0:
+                bom_table_page.table_view.selectRow(0)
+            return
+        for row_index in range(bom_table_page.table_model.rowCount()):
+            payload = bom_table_page.table_model.row_at(row_index) or {}
+            value = payload.get("id")
+            if value == row_id or (isinstance(value, str) and value.isdigit() and int(value) == row_id):
+                bom_table_page.table_view.selectRow(row_index)
+                return
+        if bom_table_page.table_model.rowCount() > 0:
+            bom_table_page.table_view.selectRow(0)
 
     def on_import_event(event: object) -> None:
         if isinstance(event, ImportStarted):
@@ -469,14 +635,18 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
     import_event_bus.subscribe(on_import_event)
 
     def on_row_selected(row_payload: dict[str, Any]) -> None:
-        if row_inspector is None:
-            return
         if not row_payload:
-            row_inspector.clear_row()
+            state["selected_row_id"] = 0
+            _persist_session_checkpoint()
+            if row_inspector is not None:
+                row_inspector.clear_row()
             window.set_status_text("No row selected")
             return
 
-        row_inspector.set_row(row_payload)
+        state["selected_row_id"] = int(row_payload.get("id", 0) or 0)
+        _persist_session_checkpoint()
+        if row_inspector is not None:
+            row_inspector.set_row(row_payload)
         designator = str(row_payload.get("designator", "")).strip() or "row"
         window.set_status_text(f"Selected {designator}")
 
@@ -547,6 +717,7 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
             state["rows"] = list(rows)
             state["project_id"] = int(project.id or 0)
             state["active_job_id"] = 0
+            state["selected_row_id"] = int(rows[0].id or 0) if rows else 0
             import_logger.info(
                 "import_completed",
                 project_id=state["project_id"],
@@ -560,7 +731,7 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
             if bom_table_page is not None:
                 bom_table_page.set_rows(rows)
                 if rows:
-                    bom_table_page.table_view.selectRow(0)
+                    _select_bom_table_row(state["selected_row_id"])
 
             if import_page is not None:
                 import_page.add_recent_import(
@@ -577,6 +748,7 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
             window.set_status_text(
                 f"Imported {report.imported_count} rows from {len(source_paths)} file(s)"
             )
+            _persist_session_checkpoint()
 
             report_dialog = ImportReportDialog(
                 file_name=Path(report.source_file).name,
@@ -650,6 +822,44 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
     if bom_table_page is not None:
         bom_table_page.row_selected.connect(on_row_selected)
 
+    async def restore_last_session() -> None:
+        projects = await repository.list_projects(limit=500)
+        project_id = _select_restore_project_id(
+            _load_session_checkpoint(checkpoint_path),
+            projects,
+        )
+        if project_id is None:
+            return
+
+        project = await repository.get_project(project_id)
+        if project is None:
+            return
+        rows = await repository.list_rows_by_project(project_id)
+        state["project_id"] = int(project.id or 0)
+        state["project_name"] = project.name
+        state["rows"] = list(rows)
+        state["active_job_id"] = 0
+        checkpoint = _load_session_checkpoint(checkpoint_path)
+        state["selected_row_id"] = _checkpoint_int(checkpoint, "selected_row_id") or 0
+
+        if bom_table_page is not None:
+            bom_table_page.set_rows(rows)
+            _select_bom_table_row(int(state.get("selected_row_id", 0) or 0))
+        window.set_row_counts(
+            total=len(rows),
+            enriched=sum(1 for row in rows if row.row_state == "enriched"),
+        )
+        window.show_page("bom_table")
+        window.set_status_text(
+            f"Restored project {project.name} with {len(rows)} saved rows"
+        )
+        import_logger.info(
+            "session_restored",
+            project_id=state["project_id"],
+            project_name=project.name,
+            row_count=len(rows),
+        )
+
     window._phase6_event_bus = import_event_bus  # type: ignore[attr-defined]
     window._phase6_import_use_case = import_use_case  # type: ignore[attr-defined]
     window._phase6_repository = repository  # type: ignore[attr-defined]
@@ -661,6 +871,7 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
     window.set_status_text("Ready for import")
     window.set_row_counts(total=0, enriched=0)
     window.set_connection_state("Provider: idle")
+    _schedule_async(restore_last_session())
 
 
 def _wire_phase7_provider_flow(window: MainWindow) -> None:
@@ -1215,6 +1426,54 @@ def _wire_phase8_enrichment_flow(window: MainWindow) -> None:
 
     job_event_bus.subscribe(on_job_event)
 
+    async def recover_interrupted_enrichment() -> None:
+        project_id = int(state.get("project_id", 0) or 0)
+        if project_id <= 0:
+            return
+
+        recovered_jobs = 0
+        for job in await job_repository.list_by_project(project_id):
+            if str(job.state).strip().lower() not in {"queued", "running", "paused"}:
+                continue
+            await job_repository.save(
+                job.model_copy(
+                    update={
+                        "state": "failed",
+                        "error_message": "Job was interrupted by app restart.",
+                        "finished_at": _utc_now(),
+                    }
+                )
+            )
+            recovered_jobs += 1
+
+        recovered_rows = 0
+        for row in await repository.list_rows_by_project(project_id):
+            normalized_state = str(row.row_state or "").strip().lower()
+            if normalized_state == "queued":
+                row.row_state = "failed"
+            elif normalized_state == "enriching":
+                row.row_state = "warning"
+            else:
+                continue
+            row.validation_warnings = _merge_restart_warning(
+                row.validation_warnings,
+                _INTERRUPTED_ENRICHMENT_MESSAGE,
+            )
+            await repository.save_row(row)
+            recovered_rows += 1
+
+        if recovered_jobs or recovered_rows:
+            enrichment_logger.warning(
+                "interrupted_enrichment_recovered",
+                project_id=project_id,
+                recovered_jobs=recovered_jobs,
+                recovered_rows=recovered_rows,
+            )
+            await refresh_project_rows()
+            window.set_status_text(
+                f"Recovered {recovered_rows} row(s) from an interrupted enrichment session"
+            )
+
     async def enrich_selected() -> None:
         row_ids = selected_row_ids()
         if not row_ids:
@@ -1284,12 +1543,14 @@ def _wire_phase8_enrichment_flow(window: MainWindow) -> None:
     window._phase8_job_repository = job_repository  # type: ignore[attr-defined]
     window._phase8_job_manager = job_manager  # type: ignore[attr-defined]
     window._phase8_job_event_bus = job_event_bus  # type: ignore[attr-defined]
+    _schedule_async(recover_interrupted_enrichment())
 
 
 def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
     part_finder_logger = logger.bind(flow="part_finder")
     repository = getattr(window, "_phase6_repository", None)
     state = getattr(window, "_phase6_state", None)
+    provider_service = getattr(window, "_phase7_provider_service", None)
     if not isinstance(repository, SqliteBomRepository):
         return
     if not isinstance(state, dict):
@@ -1304,7 +1565,23 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
     if part_finder_page is None:
         return
 
-    find_parts_use_case = FindPartsUseCase(repository, LcscEvidenceRetriever())
+    part_finder_llm_search_stage = _resolve_part_finder_llm_search_stage(provider_service)
+    part_finder_llm_stage = _resolve_part_finder_llm_stage(provider_service)
+    if part_finder_llm_search_stage is None:
+        part_finder_logger.debug("part_finder_llm_search_stage_unavailable")
+    else:
+        part_finder_logger.debug("part_finder_llm_search_stage_resolved")
+    if part_finder_llm_stage is None:
+        part_finder_logger.debug("part_finder_llm_stage_unavailable")
+    else:
+        part_finder_logger.debug("part_finder_llm_stage_resolved")
+
+    find_parts_use_case = FindPartsUseCase(
+        repository,
+        LcscEvidenceRetriever(),
+        llm_search_stage=part_finder_llm_search_stage,
+        llm_stage=part_finder_llm_stage,
+    )
 
     def _context_row_payload(criteria: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
         if criteria is not None:
@@ -1367,6 +1644,27 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     "lcsc_available": bool(payload.get("lcsc_available", False)),
                 }
         return part_finder_page.current_filters()
+
+    def _criteria_preferences(criteria: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        if criteria is not None:
+            payload = criteria.get("preferences")
+            if isinstance(payload, Mapping):
+                minimum_stock_qty = payload.get("minimum_stock_qty", 0)
+                if isinstance(minimum_stock_qty, str) and minimum_stock_qty.strip().isdigit():
+                    minimum_stock_qty = int(minimum_stock_qty.strip())
+                elif not isinstance(minimum_stock_qty, int):
+                    minimum_stock_qty = 0
+                return {
+                    "keep_same_footprint": bool(payload.get("keep_same_footprint", False)),
+                    "keep_same_manufacturer": bool(
+                        payload.get("keep_same_manufacturer", False)
+                    ),
+                    "prefer_high_availability": bool(
+                        payload.get("prefer_high_availability", False)
+                    ),
+                    "minimum_stock_qty": max(0, int(minimum_stock_qty or 0)),
+                }
+        return part_finder_page.current_preferences()
 
     def _candidate_source_row_id(candidate_row: Mapping[str, Any]) -> int | None:
         value = candidate_row.get("source_row_id")
@@ -1565,6 +1863,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
             return
 
         filters = _criteria_filters()
+        preferences = _criteria_preferences()
         part_finder_page.set_busy_state(searching=True)
         try:
             part_finder_page.set_status_message("Searching candidates from selected row...")
@@ -1573,6 +1872,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 mode="selected_row",
                 row_id=row_id,
                 filters=filters,
+                preferences=preferences,
             )
             results = await find_parts_use_case.find_candidates(
                 row_id=row_id,
@@ -1580,6 +1880,10 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     active_only=filters["active_only"],
                     in_stock=filters["in_stock"],
                     lcsc_available=filters["lcsc_available"],
+                    keep_same_footprint=preferences["keep_same_footprint"],
+                    keep_same_manufacturer=preferences["keep_same_manufacturer"],
+                    prefer_high_availability=preferences["prefer_high_availability"],
+                    minimum_stock_qty=preferences["minimum_stock_qty"] or None,
                 ),
             )
             payload = _replacement_rows_payload(results, source_row_id=row_id)
@@ -1590,6 +1894,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     mode="selected_row",
                     row_id=row_id,
                     filters=filters,
+                    preferences=preferences,
                 )
                 part_finder_page.set_status_message("No replacement candidates found.")
                 return
@@ -1602,6 +1907,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 result_count=len(results),
                 manual_review_count=needs_review,
                 filters=filters,
+                preferences=preferences,
             )
             part_finder_page.set_status_message(
                 f"Found {len(results)} candidates ({needs_review} need manual review)."
@@ -1613,6 +1919,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 row_id=row_id,
                 error=str(exc),
                 filters=filters,
+                preferences=preferences,
             )
             part_finder_page.clear_candidates()
             part_finder_page.set_status_message(f"Search failed: {exc}")
@@ -1625,6 +1932,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
             return
         context_row_id = _context_row_id(criteria)
         filters = _criteria_filters(criteria)
+        preferences = _criteria_preferences(criteria)
         part_finder_page.set_busy_state(searching=True)
         try:
             part_finder_page.set_status_message("Searching candidates...")
@@ -1633,6 +1941,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 mode="manual_criteria",
                 row_id=context_row_id,
                 criteria=dict(criteria),
+                preferences=preferences,
             )
             results = await find_parts_use_case.find_candidates(
                 row_id=context_row_id,
@@ -1644,6 +1953,10 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     active_only=filters["active_only"],
                     in_stock=filters["in_stock"],
                     lcsc_available=filters["lcsc_available"],
+                    keep_same_footprint=preferences["keep_same_footprint"],
+                    keep_same_manufacturer=preferences["keep_same_manufacturer"],
+                    prefer_high_availability=preferences["prefer_high_availability"],
+                    minimum_stock_qty=preferences["minimum_stock_qty"] or None,
                 ),
             )
             payload = _replacement_rows_payload(results, source_row_id=context_row_id)
@@ -1654,6 +1967,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     mode="manual_criteria",
                     row_id=context_row_id,
                     filters=filters,
+                    preferences=preferences,
                 )
                 part_finder_page.set_status_message("No replacement candidates found.")
                 return
@@ -1663,6 +1977,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 row_id=context_row_id,
                 result_count=len(results),
                 filters=filters,
+                preferences=preferences,
             )
             part_finder_page.set_status_message(f"Found {len(results)} candidates.")
         except Exception as exc:
@@ -1672,6 +1987,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 row_id=context_row_id,
                 error=str(exc),
                 criteria=dict(criteria),
+                preferences=preferences,
             )
             part_finder_page.clear_candidates()
             part_finder_page.set_status_message(f"Search failed: {exc}")
@@ -1685,6 +2001,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
 
         scope = str(scope_payload.get("scope", "selected_rows")).strip() or "selected_rows"
         filters = _criteria_filters(scope_payload)
+        preferences = _criteria_preferences(scope_payload)
         target_rows = _bulk_scope_rows(scope)
         part_finder_page.set_bulk_targets(
             _bulk_target_payloads(target_rows, scope=scope),
@@ -1706,6 +2023,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 batch_count=len(batches),
                 target_count=len(target_rows),
                 filters=filters,
+                preferences=preferences,
             )
             candidate_rows: list[dict[str, Any]] = []
             for batch in batches:
@@ -1715,6 +2033,10 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                         active_only=filters["active_only"],
                         in_stock=filters["in_stock"],
                         lcsc_available=filters["lcsc_available"],
+                        keep_same_footprint=preferences["keep_same_footprint"],
+                        keep_same_manufacturer=preferences["keep_same_manufacturer"],
+                        prefer_high_availability=preferences["prefer_high_availability"],
+                        minimum_stock_qty=preferences["minimum_stock_qty"] or None,
                     ),
                 )
                 candidate_rows.extend(
@@ -1741,6 +2063,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                     scope=scope,
                     target_count=len(target_rows),
                     filters=filters,
+                    preferences=preferences,
                 )
                 part_finder_page.set_status_message("No grouped replacement candidates found.")
                 return
@@ -1753,6 +2076,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 batch_count=len(batches),
                 result_count=len(candidate_rows),
                 filters=filters,
+                preferences=preferences,
             )
             part_finder_page.set_status_message(
                 f"Found {len(candidate_rows)} grouped candidates across {len(batches)} batch(es)."
@@ -1764,6 +2088,7 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
                 scope=scope,
                 error=str(exc),
                 filters=filters,
+                preferences=preferences,
             )
             part_finder_page.clear_candidates()
             part_finder_page.set_status_message(f"Search failed: {exc}")
@@ -1900,14 +2225,16 @@ def _wire_phase9_part_finder_flow(window: MainWindow) -> None:
     )
     part_finder_page.candidate_selected.connect(
         lambda candidate: part_finder_page.set_status_message(
-            (
-                "Candidate selected - "
-                + _candidate_display_name(candidate)
-                + (
-                    " (manual review recommended)"
+            " | ".join(
+                segment
+                for segment in [
+                    "Candidate selected - " + _candidate_display_name(candidate),
+                    str(candidate.get("match_explanation", "")).strip(),
+                    "manual review recommended"
                     if bool(candidate.get("requires_manual_review"))
-                    else ""
-                )
+                    else "",
+                ]
+                if segment
             )
         )
     )

@@ -27,10 +27,16 @@ from .enrichment import (
 from .export_bom import ExportBomUseCase
 from .find_parts import (
     FindPartsUseCase,
+    GroundedPartFinderStage,
+    GroundedPartFinderSearchStage,
+    PartFinderLLMSearchLeadSchema,
+    PartFinderLLMSearchResponseSchema,
     PartSearchCriteria,
     ReplacementApplicationResult,
     ReplacementConfirmationRequired,
     ReplacementSearchResult,
+    build_grounded_part_finder_search_stage,
+    build_grounded_part_finder_stage,
 )
 from .import_bom import ImportBomUseCase, ImportPreview, ImportResult
 from .job_manager import JobManager, RowExecutionResult
@@ -70,6 +76,10 @@ __all__ = [
     "BomEnrichmentUseCase",
     "ExportBomUseCase",
     "FindPartsUseCase",
+    "GroundedPartFinderStage",
+    "GroundedPartFinderSearchLeadSchema",
+    "GroundedPartFinderSearchResponseSchema",
+    "GroundedPartFinderSearchStage",
     "ImportBomUseCase",
     "ImportCompleted",
     "ImportFailed",
@@ -110,6 +120,8 @@ __all__ = [
     "ReplacementApplicationResult",
     "ReplacementConfirmationRequired",
     "ReplacementSearchResult",
+    "build_grounded_part_finder_search_stage",
+    "build_grounded_part_finder_stage",
     "RowStateTransition",
     "SearchKeyResolution",
     "StructuredEnrichmentPatch",

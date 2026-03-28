@@ -237,6 +237,20 @@ class ProviderManagementService:
 
         return build_grounded_llm_enrichment_stage(self)
 
+    def build_part_finder_stage(self):
+        """Expose the default grounded Part Finder stage for app wiring."""
+
+        from .find_parts import build_grounded_part_finder_stage
+
+        return build_grounded_part_finder_stage(self)
+
+    def build_part_finder_search_stage(self):
+        """Expose the default grounded Part Finder search planner for app wiring."""
+
+        from .find_parts import build_grounded_part_finder_search_stage
+
+        return build_grounded_part_finder_search_stage(self)
+
     def _require_adapter(self, provider: str) -> IProviderAdapter:
         try:
             return self._adapters[provider]
