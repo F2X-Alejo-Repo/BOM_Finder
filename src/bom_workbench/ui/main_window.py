@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
@@ -82,10 +83,13 @@ class MainWindow(QMainWindow):
         self._shortcuts: list[QShortcut] = []
         self._workspace_name = workspace_name
         self._app_name = app_name
+        self._last_nav_width = 240
+        self._last_inspector_width = 340
 
         self.setObjectName("MainWindow")
         self.setWindowTitle(app_name)
-        self.resize(1440, 960)
+        self.resize(1480, 980)
+        self.setMinimumSize(920, 680)
 
         self._build_app_bar()
         self._build_central_shell()
@@ -102,6 +106,8 @@ class MainWindow(QMainWindow):
 
         self.set_inspector_widget(inspector or self._create_placeholder_inspector())
         self.show_page(PAGE_KEYS[0])
+        self._sync_panel_toggle_buttons()
+        self._update_responsive_chrome()
 
     @property
     def current_page_key(self) -> str:
@@ -206,13 +212,22 @@ class MainWindow(QMainWindow):
         """Update the provider or connection indicator."""
         self.connection_label.setText(text)
 
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_responsive_chrome()
+
     def _build_app_bar(self) -> None:
         app_bar = QFrame(self)
         app_bar.setObjectName("AppBar")
         app_bar.setFrameShape(QFrame.Shape.StyledPanel)
-        layout = QHBoxLayout(app_bar)
+        layout = QVBoxLayout(app_bar)
         layout.setContentsMargins(24, 18, 24, 18)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
+
+        top_row = QWidget(app_bar)
+        top_layout = QHBoxLayout(top_row)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(16)
 
         title_block = QWidget(app_bar)
         title_layout = QVBoxLayout(title_block)
@@ -235,6 +250,7 @@ class MainWindow(QMainWindow):
         title_layout.addWidget(title)
         title_layout.addWidget(self.page_context_label)
         title_layout.addWidget(self.page_context_detail)
+        title_block.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
 
         action_cluster = QWidget(app_bar)
         action_layout = QHBoxLayout(action_cluster)
@@ -272,44 +288,91 @@ class MainWindow(QMainWindow):
         self.workspace_button.setObjectName("workspaceButton")
         self.workspace_button.setToolTip("Workspace selector placeholder")
 
+        self.nav_toggle_button = QPushButton("Navigation", app_bar)
+        self.nav_toggle_button.setObjectName("SecondaryChromeButton")
+        self.nav_toggle_button.setCheckable(True)
+        self.nav_toggle_button.setChecked(True)
+        self.nav_toggle_button.setToolTip("Show or hide the navigation rail")
+        self.nav_toggle_button.toggled.connect(self._toggle_nav_rail)
+
+        self.inspector_toggle_button = QPushButton("Inspector", app_bar)
+        self.inspector_toggle_button.setObjectName("SecondaryChromeButton")
+        self.inspector_toggle_button.setCheckable(True)
+        self.inspector_toggle_button.setChecked(True)
+        self.inspector_toggle_button.setToolTip("Show or hide the row inspector panel")
+        self.inspector_toggle_button.toggled.connect(self._toggle_inspector_panel)
+
+        chrome_layout.addWidget(self.nav_toggle_button)
+        chrome_layout.addWidget(self.inspector_toggle_button)
         chrome_layout.addWidget(self.workspace_button)
         chrome_layout.addWidget(self.theme_button)
 
-        layout.addWidget(title_block)
-        layout.addStretch(1)
-        layout.addWidget(action_cluster)
-        layout.addWidget(chrome_controls)
+        top_layout.addWidget(title_block, 1)
+        top_layout.addStretch(1)
+        top_layout.addWidget(chrome_controls, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(top_row)
+
+        bottom_row = QWidget(app_bar)
+        bottom_layout = QHBoxLayout(bottom_row)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(10)
+        bottom_layout.addWidget(action_cluster)
+        bottom_layout.addStretch(1)
+        layout.addWidget(bottom_row)
 
         self.setMenuWidget(app_bar)
 
     def _build_central_shell(self) -> None:
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.setObjectName("MainSplitter")
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(10)
+        self.splitter.splitterMoved.connect(self._handle_splitter_moved)
 
         self.nav_rail = self._build_nav_rail()
         self.page_stack = QStackedWidget(self.splitter)
         self.page_stack.setObjectName("PageStack")
+        self.page_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.page_stack.setMinimumWidth(480)
 
         self.inspector_frame = QFrame(self.splitter)
         self.inspector_frame.setObjectName("InspectorPanel")
         self.inspector_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.inspector_frame.setMinimumWidth(260)
+        self.inspector_frame.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
         inspector_layout = QVBoxLayout(self.inspector_frame)
         inspector_layout.setContentsMargins(12, 12, 12, 12)
         inspector_layout.setSpacing(12)
+
+        self.inspector_scroll_area = QScrollArea(self.inspector_frame)
+        self.inspector_scroll_area.setObjectName("InspectorScrollArea")
+        self.inspector_scroll_area.setWidgetResizable(True)
+        self.inspector_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.inspector_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
 
         self.inspector_stack = QStackedWidget(self.inspector_frame)
         self.inspector_stack.setObjectName("InspectorStack")
         self._inspector_placeholder = self._create_placeholder_inspector()
         self.inspector_stack.addWidget(self._inspector_placeholder)
-        inspector_layout.addWidget(self.inspector_stack)
+        self.inspector_scroll_area.setWidget(self.inspector_stack)
+        inspector_layout.addWidget(self.inspector_scroll_area)
 
         self.splitter.addWidget(self.nav_rail)
         self.splitter.addWidget(self.page_stack)
         self.splitter.addWidget(self.inspector_frame)
+        self.splitter.setCollapsible(0, True)
+        self.splitter.setCollapsible(1, False)
+        self.splitter.setCollapsible(2, True)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setStretchFactor(2, 0)
-        self.splitter.setSizes([220, 960, 320])
+        self.splitter.setSizes([240, 980, 340])
 
         central = QWidget(self)
         central_layout = QHBoxLayout(central)
@@ -321,8 +384,8 @@ class MainWindow(QMainWindow):
         rail = QFrame(self)
         rail.setObjectName("NavRail")
         rail.setFrameShape(QFrame.Shape.StyledPanel)
-        rail.setMinimumWidth(236)
-        rail.setMaximumWidth(280)
+        rail.setMinimumWidth(208)
+        rail.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(rail)
         layout.setContentsMargins(18, 20, 18, 18)
@@ -336,12 +399,14 @@ class MainWindow(QMainWindow):
         )
         rail_detail.setObjectName("NavSectionDetail")
         rail_detail.setWordWrap(True)
+        self.nav_section_detail = rail_detail
         layout.addWidget(rail_title)
         layout.addWidget(rail_detail)
 
         for page_key in PAGE_KEYS:
             button = QToolButton(rail)
             button.setObjectName(f"NavButton_{page_key}")
+            button.setProperty("class", "navButton")
             button.setText(PAGE_LABELS[page_key])
             button.setToolTip(PAGE_LABELS[page_key])
             button.setCheckable(True)
@@ -358,13 +423,14 @@ class MainWindow(QMainWindow):
         version_label = QLabel("Polished workspace shell", rail)
         version_label.setObjectName("NavFooterLabel")
         version_label.setProperty("muted", True)
+        self.nav_footer_label = version_label
         layout.addWidget(version_label)
         return rail
 
     def _build_status_bar(self) -> None:
         status_bar = QStatusBar(self)
         status_bar.setObjectName("StatusPanel")
-        status_bar.setSizeGripEnabled(False)
+        status_bar.setSizeGripEnabled(True)
         self.setStatusBar(status_bar)
 
         self.status_text_label = QLabel("Ready", status_bar)
@@ -379,7 +445,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setObjectName("FooterProgress")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFixedWidth(220)
+        self.progress_bar.setMinimumWidth(160)
+        self.progress_bar.setMaximumWidth(320)
+        self.progress_bar.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed
+        )
         self.progress_bar.setTextVisible(True)
 
         status_bar.addWidget(self.status_text_label, 1)
@@ -438,6 +508,71 @@ class MainWindow(QMainWindow):
         self.page_context_label.setText(PAGE_LABELS[page_key])
         self.page_context_detail.setText(PAGE_SUBTITLES.get(page_key, ""))
         self.status_text_label.setText(f"Viewing {PAGE_LABELS[page_key]}")
+
+    def _handle_splitter_moved(self, pos: int, index: int) -> None:
+        del pos, index
+        sizes = self.splitter.sizes()
+        if len(sizes) >= 3:
+            if sizes[0] > 0:
+                self._last_nav_width = sizes[0]
+            if sizes[2] > 0:
+                self._last_inspector_width = sizes[2]
+        self._sync_panel_toggle_buttons()
+
+    def _toggle_nav_rail(self, visible: bool) -> None:
+        self._set_splitter_panel_visible(
+            0, visible, fallback_size=max(self._last_nav_width, 220)
+        )
+
+    def _toggle_inspector_panel(self, visible: bool) -> None:
+        self._set_splitter_panel_visible(
+            2, visible, fallback_size=max(self._last_inspector_width, 300)
+        )
+
+    def _set_splitter_panel_visible(
+        self, panel_index: int, visible: bool, *, fallback_size: int
+    ) -> None:
+        sizes = self.splitter.sizes()
+        if panel_index >= len(sizes):
+            return
+
+        if visible:
+            if sizes[panel_index] > 0:
+                return
+            sizes[panel_index] = fallback_size
+            self.splitter.setSizes(sizes)
+            return
+
+        if sizes[panel_index] > 0:
+            if panel_index == 0:
+                self._last_nav_width = sizes[panel_index]
+            elif panel_index == 2:
+                self._last_inspector_width = sizes[panel_index]
+        sizes[panel_index] = 0
+        self.splitter.setSizes(sizes)
+
+    def _sync_panel_toggle_buttons(self) -> None:
+        sizes = self.splitter.sizes()
+        nav_visible = len(sizes) >= 1 and sizes[0] > 0
+        inspector_visible = len(sizes) >= 3 and sizes[2] > 0
+        for button, visible in (
+            (getattr(self, "nav_toggle_button", None), nav_visible),
+            (getattr(self, "inspector_toggle_button", None), inspector_visible),
+        ):
+            if button is None:
+                continue
+            button.blockSignals(True)
+            button.setChecked(visible)
+            button.blockSignals(False)
+
+    def _update_responsive_chrome(self) -> None:
+        compact_width = self.width() < 1220
+        tighter_width = self.width() < 1120
+        self.page_context_detail.setVisible(not compact_width)
+        if hasattr(self, "nav_section_detail"):
+            self.nav_section_detail.setVisible(not tighter_width)
+        if hasattr(self, "nav_footer_label"):
+            self.nav_footer_label.setVisible(not tighter_width)
 
     def _show_offset_page(self, offset: int) -> None:
         current_index = PAGE_KEYS.index(self.current_page_key)

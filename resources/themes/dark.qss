@@ -53,7 +53,7 @@ QLabel#AppContext {
 QLabel#AppContextDetail {
     color: #8e9abb;
     font-size: 10pt;
-    max-width: 420px;
+    max-width: 680px;
 }
 
 QPushButton,
@@ -224,8 +224,14 @@ QToolButton#NavButton_settings:checked {
 }
 
 QStackedWidget#PageStack,
-QStackedWidget#InspectorStack {
+QStackedWidget#InspectorStack,
+QScrollArea#PageScrollArea,
+QScrollArea#InspectorScrollArea,
+QWidget#PageScrollHost,
+QFrame[pageBody="true"],
+QWidget[pageBody="true"] {
     background: transparent;
+    border: none;
 }
 
 QFrame#PageHero,
@@ -485,6 +491,14 @@ QScrollBar::add-page,
 QScrollBar::sub-page {
     background: transparent;
     border: none;
+}
+
+QSplitter::handle {
+    background-color: rgba(33, 46, 71, 0.88);
+}
+
+QSplitter::handle:hover {
+    background-color: rgba(74, 120, 199, 0.92);
 }
 
 QLabel#inspectorHeading,

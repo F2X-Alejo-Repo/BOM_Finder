@@ -8,7 +8,7 @@ from typing import Any
 
 from PySide6 import QtCore, QtWidgets
 
-from . import SimplePage, create_card
+from . import SimplePage, configure_data_table, create_card
 
 
 class JobsPage(SimplePage):
@@ -55,8 +55,24 @@ class JobsPage(SimplePage):
         self.jobs_table.setEditTriggers(
             QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
         )
+        self.jobs_table.setShowGrid(False)
         self.jobs_table.verticalHeader().setVisible(False)
-        self.jobs_table.horizontalHeader().setStretchLastSection(True)
+        configure_data_table(
+            self.jobs_table,
+            stretch_column=4,
+            minimum_height=320,
+            default_section_size=140,
+            minimum_section_size=84,
+        )
+        self.jobs_table.verticalHeader().setDefaultSectionSize(38)
+        header = self.jobs_table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.jobs_table.itemSelectionChanged.connect(self._refresh_selected_details)
 
         details = create_card(
@@ -69,6 +85,22 @@ class JobsPage(SimplePage):
         self.details_text = QtWidgets.QPlainTextEdit(self)
         self.details_text.setReadOnly(True)
         self.details_text.setPlainText("No job selected.")
+        self.details_text.setMinimumHeight(140)
+
+        content_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self)
+        content_splitter.setChildrenCollapsible(False)
+        content_splitter.setHandleWidth(8)
+        content_splitter.addWidget(self.jobs_table)
+
+        details_panel = QtWidgets.QWidget(self)
+        details_layout = QtWidgets.QVBoxLayout(details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(12)
+        details_layout.addWidget(details)
+        details_layout.addWidget(self.details_text, 1)
+        content_splitter.addWidget(details_panel)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
 
         self.pause_all_button.clicked.connect(self.pause_all_requested.emit)
         self.resume_all_button.clicked.connect(self.resume_all_requested.emit)
@@ -77,9 +109,7 @@ class JobsPage(SimplePage):
         self.clear_button.clicked.connect(self._handle_clear_clicked)
 
         self.content_layout.addLayout(action_row)
-        self.content_layout.addWidget(self.jobs_table)
-        self.content_layout.addWidget(details)
-        self.content_layout.addWidget(self.details_text)
+        self.content_layout.addWidget(content_splitter, 1)
 
     def clear_jobs(self) -> None:
         """Clear all job rows and details."""

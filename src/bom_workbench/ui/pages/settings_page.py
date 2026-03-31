@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from . import SimplePage, create_card
 
@@ -43,6 +43,13 @@ class SettingsPage(SimplePage):
             ],
         )
 
-        self.content_layout.addWidget(privacy_card)
-        self.content_layout.addWidget(storage_card)
+        workspace_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
+        workspace_splitter.setChildrenCollapsible(False)
+        workspace_splitter.addWidget(privacy_card)
+        workspace_splitter.addWidget(storage_card)
+        workspace_splitter.setStretchFactor(0, 1)
+        workspace_splitter.setStretchFactor(1, 1)
+        workspace_splitter.setSizes([420, 420])
+
+        self.content_layout.addWidget(workspace_splitter)
         self.content_layout.addWidget(info)

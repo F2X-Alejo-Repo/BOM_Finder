@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from bom_workbench.app import MainWindow, bootstrap
-
-
 def test_bootstrap_headless_returns_zero() -> None:
     """Headless bootstrap should exit immediately for CI."""
+    pytest.importorskip("sqlmodel")
+
+    from bom_workbench.app import bootstrap
+
     assert bootstrap(["--headless"]) == 0
 
 
@@ -21,6 +22,7 @@ def test_main_window_can_be_instantiated_offscreen(
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
     from PySide6 import QtWidgets
+    from bom_workbench.ui.main_window import MainWindow
 
     app = QtWidgets.QApplication.instance()
     if app is None:
@@ -32,6 +34,8 @@ def test_main_window_can_be_instantiated_offscreen(
     assert window.page_stack.count() == 7
     assert len(window.nav_buttons) == 7
     assert window.inspector is not None
+    assert window.statusBar().isSizeGripEnabled() is True
+    assert window.splitter.handleWidth() == 10
 
     window.close()
     app.processEvents()

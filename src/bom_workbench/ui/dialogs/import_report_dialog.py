@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 
 class ImportReportDialog(QtWidgets.QDialog):
@@ -23,6 +23,8 @@ class ImportReportDialog(QtWidgets.QDialog):
         self.setWindowTitle("Import Report")
         self.setModal(True)
         self.resize(640, 480)
+        self.setMinimumSize(620, 460)
+        self.setSizeGripEnabled(True)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -50,13 +52,19 @@ class ImportReportDialog(QtWidgets.QDialog):
         )
         root.addWidget(summary_group)
 
-        lists_layout = QtWidgets.QHBoxLayout()
-        lists_layout.addWidget(self._build_list_group("Warnings", warnings or []))
-        lists_layout.addWidget(self._build_list_group("Errors", errors or []))
-        lists_layout.addWidget(
-            self._build_list_group("Unmapped columns", unmapped_columns or [])
+        self.details_tabs = QtWidgets.QTabWidget(self)
+        self.details_tabs.setDocumentMode(True)
+        self.details_tabs.addTab(
+            self._build_list_group("Warnings", warnings or []), "Warnings"
         )
-        root.addLayout(lists_layout)
+        self.details_tabs.addTab(
+            self._build_list_group("Errors", errors or []), "Errors"
+        )
+        self.details_tabs.addTab(
+            self._build_list_group("Unmapped columns", unmapped_columns or []),
+            "Unmapped columns",
+        )
+        root.addWidget(self.details_tabs, 1)
 
         button_box = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok, self
@@ -70,6 +78,11 @@ class ImportReportDialog(QtWidgets.QDialog):
         group = QtWidgets.QGroupBox(title, self)
         layout = QtWidgets.QVBoxLayout(group)
         list_widget = QtWidgets.QListWidget(group)
-        list_widget.addItems(items)
+        if items:
+            list_widget.addItems(items)
+        else:
+            placeholder = QtWidgets.QListWidgetItem("None")
+            placeholder.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+            list_widget.addItem(placeholder)
         layout.addWidget(list_widget)
         return group

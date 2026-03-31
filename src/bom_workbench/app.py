@@ -1474,6 +1474,20 @@ def _wire_phase8_enrichment_flow(window: MainWindow) -> None:
                 f"Recovered {recovered_rows} row(s) from an interrupted enrichment session"
             )
 
+    def selected_row_ids() -> list[int]:
+        if bom_table_page is None:
+            return []
+        row_ids: list[int] = []
+        for payload in bom_table_page.selected_row_payloads():
+            value = payload.get("id")
+            if isinstance(value, int) and value > 0 and value not in row_ids:
+                row_ids.append(value)
+            elif isinstance(value, str) and value.isdigit():
+                parsed = int(value)
+                if parsed > 0 and parsed not in row_ids:
+                    row_ids.append(parsed)
+        return row_ids
+
     async def enrich_selected() -> None:
         row_ids = selected_row_ids()
         if not row_ids:

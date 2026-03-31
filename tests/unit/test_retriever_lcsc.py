@@ -114,7 +114,7 @@ async def test_retriever_uses_lcsc_part_number_before_other_keys(
 
     _patch_async_client(monkeypatch, handler)
 
-    retriever = LcscEvidenceRetriever(base_url="https://example.test")
+    retriever = LcscEvidenceRetriever(base_url="https://example.test", api_base_url="", jlcpcb_api_base_url="")
     evidence = await retriever.retrieve(
         SearchKeys(
             lcsc_part_number="C12345",
@@ -165,7 +165,7 @@ async def test_retriever_falls_back_through_strategies_and_caches(
 
     _patch_async_client(monkeypatch, handler)
 
-    retriever = LcscEvidenceRetriever(base_url="https://example.test")
+    retriever = LcscEvidenceRetriever(base_url="https://example.test", api_base_url="")
     keys = SearchKeys(category="capacitator", footprint="0402", param_summary="1uF")
 
     first = await retriever.retrieve(keys)
@@ -203,7 +203,7 @@ async def test_retriever_skips_generic_search_shell_and_falls_back_to_source_url
 
     _patch_async_client(monkeypatch, handler)
 
-    retriever = LcscEvidenceRetriever(base_url="https://www.lcsc.com")
+    retriever = LcscEvidenceRetriever(base_url="https://www.lcsc.com", api_base_url="", jlcpcb_api_base_url="")
     evidence = await retriever.retrieve(
         SearchKeys(
             lcsc_part_number="C14663",
@@ -221,3 +221,291 @@ async def test_retriever_skips_generic_search_shell_and_falls_back_to_source_url
     payload = json.loads(evidence[0].raw_content)
     assert payload["lcsc_part_number"] == "C14663"
     assert payload["source_name"] == "JLCPCB"
+
+
+@pytest.mark.anyio
+async def test_retriever_falls_back_to_parametric_search_after_mpn_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When MPN search returns a generic shell, parametric fallback is tried next and succeeds."""
+    requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url)
+        search_term = request.url.params.get("searchTerm")
+        if search_term == "MISS-0603":
+            return httpx.Response(
+                200,
+                text=_C14663_SEARCH_SHELL_HTML,
+                headers={"content-type": "text/html"},
+            )
+        # parametric_fallback and all other HTML fallbacks return plain text evidence.
+        return httpx.Response(200, text="fallback evidence")
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(base_url="https://example.test", api_base_url="")
+    evidence = await retriever.retrieve(
+        SearchKeys(
+            mpn="MISS-0603",
+            footprint="0603",
+            comment="100nF capacitor",
+        )
+    )
+
+    # MPN search fails (generic shell), then parametric_fallback succeeds.
+    assert requests == [
+        httpx.URL("https://example.test/search?searchTerm=MISS-0603"),
+        httpx.URL("https://example.test/search?footprint=0603&param_summary=100nF+capacitor"),
+    ]
+    assert len(evidence) == 1
+    assert evidence[0].search_strategy == "parametric_fallback"
+
+
+@pytest.mark.anyio
+async def test_retriever_continues_past_unstructured_html_to_later_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url)
+        if request.url.params.get("searchTerm") == "MISS-0603":
+            return httpx.Response(
+                200,
+                text="<html><head><title>Search Results</title></head><body>No structured payload</body></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(200, text="fallback evidence")
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(base_url="https://example.test", api_base_url="")
+    evidence = await retriever.retrieve(
+        SearchKeys(
+            mpn="MISS-0603",
+            footprint="0603",
+            comment="100nF capacitor",
+        )
+    )
+
+    assert requests[:2] == [
+        httpx.URL("https://example.test/search?searchTerm=MISS-0603"),
+        httpx.URL("https://example.test/search?footprint=0603&param_summary=100nF+capacitor"),
+    ]
+    assert len(evidence) == 1
+    assert evidence[0].search_strategy == "parametric_fallback"
+
+
+@pytest.mark.anyio
+async def test_retriever_uses_api_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API-first path: JSON response is parsed into candidates without HTML scraping."""
+    api_response = {
+        "code": 200,
+        "result": {
+            "productList": [
+                {
+                    "productCode": "C14663",
+                    "productModel": "CC0603KRX7R9BB104",
+                    "brandNameEn": "YAGEO",
+                    "encapStandard": "0603",
+                    "productDescEn": "100nF ±10% 50V Ceramic Capacitor X7R 0603",
+                    "stockNumber": 2314200,
+                    "productCycle": "normal",
+                    "catalogName": "Ceramic Capacitors",
+                    "parentCatalogName": "Capacitors",
+                    "productPriceList": [
+                        {"ladder": 100, "usdPrice": "0.0028"},
+                        {"ladder": 4000, "usdPrice": "0.0018"},
+                    ],
+                }
+            ],
+            "totalCount": 1,
+        },
+    }
+
+    html_requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if "wmsc.lcsc.com" in request.url.host:
+            return httpx.Response(
+                200,
+                json=api_response,
+                headers={"content-type": "application/json"},
+            )
+        html_requests.append(request.url)
+        return httpx.Response(200, text="<html></html>", headers={"content-type": "text/html"})
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(base_url="https://example.test")
+    evidence = await retriever.retrieve(
+        SearchKeys(mpn="CC0603KRX7R9BB104", footprint="0603", param_summary="100nF")
+    )
+
+    # HTML scraping should not be needed when the API succeeds.
+    assert html_requests == []
+    assert len(evidence) == 1
+    assert evidence[0].search_strategy == "lcsc_api_search"
+    assert evidence[0].source_name == "LCSC"
+
+    candidates = json.loads(evidence[0].raw_content)["candidates"]
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["lcsc_part_number"] == "C14663"
+    assert c["mpn"] == "CC0603KRX7R9BB104"
+    assert c["manufacturer"] == "YAGEO"
+    assert c["package"] == "0603"
+    assert c["stock_qty"] == 2314200
+    assert c["lifecycle_status"] == "active"
+    assert c["unit_price_usd"] == pytest.approx(0.0028)
+    assert c["lcsc_link"] == "https://www.lcsc.com/product-detail/C14663.html"
+
+
+@pytest.mark.anyio
+async def test_retriever_queries_jlcpcb_when_lcsc_part_is_out_of_stock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When LCSC API returns stock_qty=0, JLCPCB is queried and evidence from both is returned."""
+    lcsc_api_response = {
+        "code": 200,
+        "result": {
+            "productList": [
+                {
+                    "productCode": "C14663",
+                    "productModel": "CC0603KRX7R9BB104",
+                    "brandNameEn": "YAGEO",
+                    "encapStandard": "0603",
+                    "productDescEn": "100nF ±10% 50V Ceramic Capacitor X7R 0603",
+                    "stockNumber": 0,  # out of stock on LCSC
+                    "productCycle": "normal",
+                    "catalogName": "Ceramic Capacitors",
+                    "parentCatalogName": "Capacitors",
+                    "productPriceList": [{"ladder": 100, "usdPrice": "0.0028"}],
+                }
+            ],
+            "totalCount": 1,
+        },
+    }
+    jlcpcb_api_response = {
+        "code": 200,
+        "data": {
+            "componentCode": "C14663",
+            "componentModelEn": "CC0603KRX7R9BB104",
+            "componentBrandEn": "YAGEO",
+            "componentSpecificationEn": "0603",
+            "describe": "100nF ±10% 50V Ceramic Capacitor X7R 0603",
+            "stockCount": 38793128,
+            "leastNumber": 100,
+            "productPriceList": [
+                {"startNumber": 100, "productPrice": "0.0030"},
+                {"startNumber": 4000, "productPrice": "0.0020"},
+            ],
+        },
+    }
+
+    jlcpcb_requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if "wmsc.lcsc.com" in request.url.host:
+            return httpx.Response(200, json=lcsc_api_response, headers={"content-type": "application/json"})
+        if "cart.jlcpcb.com" in request.url.host:
+            jlcpcb_requests.append(request.url)
+            return httpx.Response(200, json=jlcpcb_api_response, headers={"content-type": "application/json"})
+        return httpx.Response(200, text="<html></html>", headers={"content-type": "text/html"})
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(base_url="https://example.test")
+    evidence = await retriever.retrieve(SearchKeys(mpn="CC0603KRX7R9BB104", footprint="0603"))
+
+    # JLCPCB must have been queried because LCSC stock was 0.
+    assert len(jlcpcb_requests) == 1
+    assert jlcpcb_requests[0].params.get("componentCode") == "C14663"
+
+    # Evidence from both sources is returned.
+    assert len(evidence) == 2
+    strategies = {ev.search_strategy for ev in evidence}
+    assert strategies == {"lcsc_api_search", "jlcpcb_component_detail"}
+
+    jlcpcb_ev = next(ev for ev in evidence if ev.search_strategy == "jlcpcb_component_detail")
+    assert jlcpcb_ev.source_name == "JLCPCB"
+    payload = json.loads(jlcpcb_ev.raw_content)
+    assert payload["lcsc_part_number"] == "C14663"
+    assert payload["mpn"] == "CC0603KRX7R9BB104"
+    assert payload["manufacturer"] == "YAGEO"
+    assert payload["stock_qty"] == 38793128
+    assert payload["stock_status"] == "high"
+    assert payload["moq"] == 100
+    assert payload["unit_price_usd"] == pytest.approx(0.0030)
+    assert payload["jlcpcb_link"] == "https://jlcpcb.com/partdetail/C14663"
+
+
+@pytest.mark.anyio
+async def test_retriever_queries_jlcpcb_for_known_c_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When search keys contain a C-number, JLCPCB is queried regardless of stock status."""
+    jlcpcb_api_response = {
+        "code": 200,
+        "data": {
+            "componentCode": "C12345",
+            "componentModelEn": "SOME-PART",
+            "componentBrandEn": "ACME",
+            "stockCount": 5000,
+            "leastNumber": 10,
+        },
+    }
+
+    jlcpcb_requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if "wmsc.lcsc.com" in request.url.host:
+            # LCSC API returns nothing.
+            return httpx.Response(200, json={"code": 200, "result": {"productList": [], "totalCount": 0}}, headers={"content-type": "application/json"})
+        if "cart.jlcpcb.com" in request.url.host:
+            jlcpcb_requests.append(request.url)
+            return httpx.Response(200, json=jlcpcb_api_response, headers={"content-type": "application/json"})
+        return httpx.Response(200, text="<html></html>", headers={"content-type": "text/html"})
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(base_url="https://example.test")
+    evidence = await retriever.retrieve(SearchKeys(lcsc_part_number="C12345"))
+
+    assert len(jlcpcb_requests) == 1
+    assert jlcpcb_requests[0].params.get("componentCode") == "C12345"
+
+    jlcpcb_ev = next((ev for ev in evidence if ev.search_strategy == "jlcpcb_component_detail"), None)
+    assert jlcpcb_ev is not None
+    assert jlcpcb_ev.source_name == "JLCPCB"
+    payload = json.loads(jlcpcb_ev.raw_content)
+    assert payload["lcsc_part_number"] == "C12345"
+    assert payload["stock_qty"] == 5000
+    assert payload["stock_status"] == "high"
+
+
+@pytest.mark.anyio
+async def test_retriever_skips_jlcpcb_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When jlcpcb_api_base_url is empty, JLCPCB is never queried."""
+    jlcpcb_requests: list[httpx.URL] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if "cart.jlcpcb.com" in request.url.host:
+            jlcpcb_requests.append(request.url)
+        return httpx.Response(200, text="fallback evidence")
+
+    _patch_async_client(monkeypatch, handler)
+
+    retriever = LcscEvidenceRetriever(
+        base_url="https://example.test",
+        api_base_url="",
+        jlcpcb_api_base_url="",
+    )
+    await retriever.retrieve(SearchKeys(lcsc_part_number="C12345"))
+
+    assert jlcpcb_requests == []

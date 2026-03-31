@@ -180,8 +180,39 @@ async def test_find_candidates_from_explicit_criteria_uses_priority_order() -> N
 
     assert len(results) == 1
     assert use_case._retriever.calls[0].lcsc_part_number == "C12345"
-    assert use_case._retriever.calls[0].footprint == "0402"
+    assert use_case._retriever.calls[1].footprint == "0402"
     assert results[0].candidate.mpn == "C12345-ALT"
+
+
+@pytest.mark.anyio
+async def test_find_candidates_treats_c_prefixed_mpn_as_mpn_not_lcsc_code() -> None:
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "CC0603KRX7R9BB104",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 1200,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        criteria=PartSearchCriteria(
+            part_number="CC0603KRX7R9BB104",
+            footprint="0603",
+            value="100nF capacitor",
+        )
+    )
+
+    assert len(results) == 1
+    assert use_case._retriever.calls[0].lcsc_part_number == ""
+    assert use_case._retriever.calls[0].mpn == "CC0603KRX7R9BB104"
+    assert results[0].candidate.mpn == "CC0603KRX7R9BB104"
 
 
 @pytest.mark.anyio
@@ -223,8 +254,8 @@ async def test_find_candidates_with_row_and_criteria_uses_detached_context_copy(
     assert len(results) == 1
     assert use_case._retriever.calls[0].lcsc_part_number == "C22222"
     assert use_case._retriever.calls[0].source_url == "https://vendor.test/override"
-    assert use_case._retriever.calls[0].comment == "override comment"
-    assert use_case._retriever.calls[0].footprint == "0805"
+    assert use_case._retriever.calls[1].comment == "override comment"
+    assert use_case._retriever.calls[1].footprint == "0805"
     assert repo.rows[5].lcsc_part_number == "C11111"
     assert repo.rows[5].source_url == "https://vendor.test/base"
     assert repo.rows[5].comment == "original comment"
@@ -298,6 +329,35 @@ async def test_find_candidates_applies_requested_filters() -> None:
 
 
 @pytest.mark.anyio
+async def test_find_candidates_active_only_allows_unknown_lifecycle() -> None:
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Unknown Lifecycle Parts",
+                "mpn": "UNKNOWN-1",
+                "footprint": "0603",
+                "value_summary": "10k resistor",
+                "stock_qty": 250,
+                "confidence": "high",
+                "lcsc_part_number": "C70001",
+            }
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        criteria=PartSearchCriteria(
+            footprint="0603",
+            value="10k resistor",
+            active_only=True,
+        )
+    )
+
+    assert [result.candidate.mpn for result in results] == ["UNKNOWN-1"]
+    assert results[0].requires_manual_review is True
+
+
+@pytest.mark.anyio
 async def test_find_candidates_applies_constraint_preferences() -> None:
     row = _make_row(
         id=8,
@@ -363,6 +423,52 @@ async def test_find_candidates_applies_constraint_preferences() -> None:
     )
 
     assert [result.candidate.mpn for result in results] == ["MATCH-1"]
+
+
+@pytest.mark.anyio
+async def test_find_candidates_uses_stock_status_when_quantity_missing() -> None:
+    row = _make_row(id=18, comment="100nF capacitor", footprint="0603")
+    evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Strong Status Parts",
+                "mpn": "STATUS-HIGH",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_status": "high",
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ]
+    )
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([evidence]))
+
+    results = await use_case.find_candidates(
+        row_id=18,
+        criteria=PartSearchCriteria(minimum_stock_qty=100),
+    )
+
+    assert [result.candidate.mpn for result in results] == ["STATUS-HIGH"]
+
+
+def test_candidate_filter_rejection_reasons_include_minimum_stock_qty() -> None:
+    row = _make_row(id=19, comment="100 ohm resistor", footprint="Resistor_SMD:R_0603_1608Metric")
+    candidate = _make_candidate(
+        mpn="LOW-STOCK-100R",
+        footprint="0603",
+        package="0603",
+        value_summary="100 ohm resistor",
+        stock_status="high",
+    )
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([]))
+
+    reasons = use_case._candidate_filter_rejection_reasons(
+        candidate,
+        PartSearchCriteria(keep_same_footprint=True, minimum_stock_qty=20_000),
+        row,
+    )
+
+    assert reasons == ["minimum_stock_qty:20000"]
 
 
 @pytest.mark.anyio
@@ -534,8 +640,132 @@ async def test_find_candidates_expands_search_with_grounded_llm_leads() -> None:
 
     results = await use_case.find_candidates(row_id=13)
 
-    assert len(retriever.calls) == 2
+    assert len(retriever.calls) == 3
+    assert retriever.calls[-1].lcsc_part_number == "C14663"
     assert results[0].candidate.lcsc_part_number == "C14663"
+
+
+@pytest.mark.anyio
+async def test_find_candidates_uses_staged_search_plan_for_replacements() -> None:
+    row = _make_row(
+        id=15,
+        mpn="CAP-100N-0603",
+        comment="100nF capacitor",
+        footprint="0603",
+        category="Capacitors/Ceramic Capacitors",
+    )
+
+    exact_evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "YAGEO",
+                "mpn": "CAP-100N-0603",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 2500,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ],
+        strategy="exact_reference",
+    )
+    focused_evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Murata",
+                "mpn": "GRM188R71H104KA93D",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 4000,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ],
+        strategy="value_footprint",
+    )
+    broad_evidence = _make_evidence(
+        [
+            {
+                "manufacturer": "Samsung",
+                "mpn": "CL10B104KB8NNNC",
+                "footprint": "0603",
+                "value_summary": "100nF capacitor",
+                "stock_qty": 1800,
+                "lifecycle_status": "active",
+                "confidence": "high",
+            }
+        ],
+        strategy="broad_text",
+    )
+
+    class StageAwareRetriever:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        async def retrieve(self, search_keys: object) -> list[RawEvidence]:
+            self.calls.append(search_keys)
+            if getattr(search_keys, "mpn", "") == "CAP-100N-0603":
+                return [exact_evidence]
+            if getattr(search_keys, "footprint", "") == "0603":
+                return [focused_evidence]
+            return [broad_evidence]
+
+    retriever = StageAwareRetriever()
+    use_case = FindPartsUseCase(FakeRepository([row]), retriever)
+
+    results = await use_case.find_candidates_for_row(15)
+
+    assert [call.mpn for call in retriever.calls] == [
+        "CAP-100N-0603",
+        "",
+        "",
+    ]
+    assert [call.footprint for call in retriever.calls] == [
+        "",
+        "0603",
+        "",
+    ]
+    assert [call.param_summary for call in retriever.calls] == [
+        "",
+        "100nF capacitor",
+        "100nF capacitor",
+    ]
+    result_mpns = [result.candidate.mpn for result in results]
+    # Exact match must rank first; the other two stages both contribute candidates.
+    assert result_mpns[0] == "CAP-100N-0603"
+    assert set(result_mpns[1:3]) == {"GRM188R71H104KA93D", "CL10B104KB8NNNC"}
+
+
+def test_search_keys_from_llm_lead_preserves_matching_jlc_source_url() -> None:
+    row = _make_row(
+        id=16,
+        source_url="https://jlcpcb.com/partdetail/Yageo-CC0603KRX7R9BB104/C14663",
+        lcsc_link="https://jlcpcb.com/partdetail/Yageo-CC0603KRX7R9BB104/C14663",
+    )
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([]))
+    lead = PartFinderLLMSearchResponseSchema(
+        search_leads=[
+            {
+                "lcsc_part_number": "C14663",
+                "mpn": "CC0603KRX7R9BB104",
+                "footprint": "0603",
+            }
+        ]
+    ).search_leads[0]
+
+    search_keys = use_case._search_keys_from_llm_lead(lead, row, PartSearchCriteria())
+
+    assert search_keys.source_url == "https://jlcpcb.com/partdetail/Yageo-CC0603KRX7R9BB104/C14663"
+
+
+def test_resolve_search_keys_uses_comment_as_param_summary_fallback() -> None:
+    row = _make_row(id=14, comment="100nF capacitor", footprint="0603")
+    use_case = FindPartsUseCase(FakeRepository([row]), FakeRetriever([]))
+
+    resolution = use_case.resolve_search_keys(row)
+
+    assert resolution.search_keys.comment == "100nF capacitor"
+    assert resolution.search_keys.param_summary == "100nF capacitor"
 
 
 @pytest.mark.anyio

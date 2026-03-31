@@ -7,7 +7,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFormLayout, QFrame, QGroupBox, QLabel, QVBoxLayout
+from PySide6.QtWidgets import (
+    QFormLayout,
+    QFrame,
+    QGroupBox,
+    QLabel,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 class RowInspector(QFrame):
@@ -51,24 +59,36 @@ class RowInspector(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        title = QLabel("Row Inspector", self)
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        root.addWidget(scroll_area)
+
+        content = QWidget(scroll_area)
+        scroll_area.setWidget(content)
+
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(12, 12, 12, 12)
+        content_layout.setSpacing(12)
+
+        title = QLabel("Row Inspector", content)
         title.setObjectName("inspectorHeading")
-        root.addWidget(title)
+        content_layout.addWidget(title)
 
         self.subtitle = QLabel(
-            "Select a BOM row to view its normalized fields.", self
+            "Select a BOM row to view its normalized fields.", content
         )
         self.subtitle.setWordWrap(True)
         self.subtitle.setProperty("muted", True)
-        root.addWidget(self.subtitle)
+        content_layout.addWidget(self.subtitle)
 
         self._value_labels: dict[str, QLabel] = {}
 
         for group_title, fields in self._field_groups:
-            group = QGroupBox(group_title, self)
+            group = QGroupBox(group_title, content)
             form = QFormLayout(group)
             form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             for field_key, field_label in fields:
@@ -80,9 +100,9 @@ class RowInspector(QFrame):
                 )
                 self._value_labels[field_key] = value_label
                 form.addRow(field_label, value_label)
-            root.addWidget(group)
+            content_layout.addWidget(group)
 
-        root.addStretch(1)
+        content_layout.addStretch(1)
 
     def set_row(self, row_data: Mapping[str, Any] | None) -> None:
         """Populate the inspector with BomRow-like dictionary values."""

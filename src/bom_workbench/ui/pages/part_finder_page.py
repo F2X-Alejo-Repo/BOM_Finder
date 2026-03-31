@@ -8,7 +8,7 @@ from typing import Any
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 
-from . import SimplePage, create_card
+from . import SimplePage, configure_data_table, create_card
 
 
 class _BaseTableModel(QtCore.QAbstractTableModel):
@@ -168,6 +168,7 @@ class PartFinderPage(SimplePage):
         self.context_summary.setWordWrap(True)
 
         self.mode_tabs = QtWidgets.QTabWidget(self)
+        self.mode_tabs.setDocumentMode(True)
         self.single_tab = QtWidgets.QWidget(self.mode_tabs)
         self.bulk_tab = QtWidgets.QWidget(self.mode_tabs)
         self.mode_tabs.addTab(self.single_tab, "Single Row")
@@ -215,6 +216,14 @@ class PartFinderPage(SimplePage):
         strategy_layout.addWidget(QtWidgets.QLabel("Minimum stock qty", strategy_card), 1, 1)
         strategy_layout.addWidget(self.minimum_stock_qty_spin, 1, 2)
 
+        self.controls_splitter = QtWidgets.QSplitter(Qt.Orientation.Horizontal, self)
+        self.controls_splitter.setChildrenCollapsible(False)
+        self.controls_splitter.addWidget(filters_card)
+        self.controls_splitter.addWidget(strategy_card)
+        self.controls_splitter.setStretchFactor(0, 1)
+        self.controls_splitter.setStretchFactor(1, 1)
+        self.controls_splitter.setSizes([460, 620])
+
         candidates_group = QtWidgets.QGroupBox("Replacement Candidates", self)
         candidates_layout = QtWidgets.QVBoxLayout(candidates_group)
         self.candidate_model = _CandidateTableModel(self)
@@ -227,9 +236,28 @@ class PartFinderPage(SimplePage):
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
         self.candidate_view.setAlternatingRowColors(True)
+        self.candidate_view.setShowGrid(False)
         self.candidate_view.setSortingEnabled(False)
         self.candidate_view.verticalHeader().setVisible(False)
-        self.candidate_view.horizontalHeader().setStretchLastSection(True)
+        configure_data_table(
+            self.candidate_view,
+            stretch_column=5,
+            minimum_height=320,
+            default_section_size=150,
+            minimum_section_size=84,
+        )
+        self.candidate_view.verticalHeader().setDefaultSectionSize(38)
+        candidate_header = self.candidate_view.horizontalHeader()
+        candidate_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        candidate_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        candidate_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        candidate_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        candidate_header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        candidate_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        candidate_header.setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        candidate_header.setSectionResizeMode(7, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.candidate_view.setColumnWidth(3, 140)
+        self.candidate_view.setColumnWidth(4, 160)
         candidates_layout.addWidget(self.candidate_view)
 
         action_row = QtWidgets.QHBoxLayout()
@@ -247,9 +275,8 @@ class PartFinderPage(SimplePage):
         self.content_layout.addWidget(context_card)
         self.content_layout.addWidget(self.context_summary)
         self.content_layout.addWidget(self.mode_tabs)
-        self.content_layout.addWidget(filters_card)
-        self.content_layout.addWidget(strategy_card)
-        self.content_layout.addWidget(candidates_group)
+        self.content_layout.addWidget(self.controls_splitter)
+        self.content_layout.addWidget(candidates_group, 1)
         self.content_layout.addLayout(action_row)
         self.content_layout.addWidget(self.status_label)
 
@@ -301,6 +328,7 @@ class PartFinderPage(SimplePage):
 
         layout.addWidget(search_card)
         layout.addLayout(action_row)
+        layout.addStretch(1)
 
     def _build_bulk_tab(self) -> None:
         layout = QtWidgets.QVBoxLayout(self.bulk_tab)
@@ -338,14 +366,30 @@ class PartFinderPage(SimplePage):
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
         self.target_view.setAlternatingRowColors(True)
+        self.target_view.setShowGrid(False)
         self.target_view.setSortingEnabled(False)
         self.target_view.verticalHeader().setVisible(False)
-        self.target_view.horizontalHeader().setStretchLastSection(True)
+        configure_data_table(
+            self.target_view,
+            stretch_column=5,
+            minimum_height=280,
+            default_section_size=140,
+            minimum_section_size=84,
+        )
+        self.target_view.verticalHeader().setDefaultSectionSize(38)
+        target_header = self.target_view.horizontalHeader()
+        target_header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        target_header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        target_header.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        target_header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        target_header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        target_header.setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.target_view.setColumnWidth(2, 150)
         targets_layout.addWidget(self.target_view)
 
         layout.addWidget(bulk_scope_card)
         layout.addWidget(self.bulk_summary)
-        layout.addWidget(targets_group)
+        layout.addWidget(targets_group, 1)
 
     def set_candidates(self, candidates: Sequence[Mapping[str, Any]]) -> None:
         self._candidates = [dict(candidate) for candidate in candidates]

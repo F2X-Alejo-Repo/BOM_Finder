@@ -102,8 +102,15 @@ class ProvidersPage(SimplePage):
         self.save_button.setObjectName("saveProvidersButton")
         self.save_button.clicked.connect(self._emit_save_settings)
 
-        self.content_layout.addWidget(self._provider_cards["openai"].group)
-        self.content_layout.addWidget(self._provider_cards["anthropic"].group)
+        provider_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
+        provider_splitter.setChildrenCollapsible(False)
+        provider_splitter.addWidget(self._provider_cards["openai"].group)
+        provider_splitter.addWidget(self._provider_cards["anthropic"].group)
+        provider_splitter.setStretchFactor(0, 1)
+        provider_splitter.setStretchFactor(1, 1)
+        provider_splitter.setSizes([540, 540])
+
+        self.content_layout.addWidget(provider_splitter)
         self.content_layout.addWidget(info)
         self.content_layout.addWidget(self.save_button)
 

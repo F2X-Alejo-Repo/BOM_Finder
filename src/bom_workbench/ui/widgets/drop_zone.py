@@ -19,8 +19,10 @@ class DropZone(QFrame):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setObjectName("dropZone")
+        self.setMinimumHeight(180)
         self._label = QLabel(label, self)
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._label.setWordWrap(True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)

@@ -20,6 +20,9 @@ from ..providers.base import build_timeout
 LCSC_BASE_URL = "https://www.lcsc.com"
 LCSC_SEARCH_PATH = "/search"
 LCSC_PRODUCT_DETAIL_PATH = "/product-detail/{part_number}.html"
+LCSC_API_BASE_URL = "https://wmsc.lcsc.com"
+LCSC_API_SEARCH_PATH = "/ftps/wbGetSearchMultiSearch"
+LCSC_API_PAGE_SIZE = 25
 DEFAULT_READ_TIMEOUT = 15.0
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -35,6 +38,31 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
+LCSC_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.lcsc.com/",
+    "Origin": "https://www.lcsc.com",
+}
+JLCPCB_API_BASE_URL = "https://cart.jlcpcb.com"
+JLCPCB_COMPONENT_DETAIL_PATH = "/shoppingCart/smtGood/getComponentDetail"
+JLCPCB_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://jlcpcb.com/",
+    "Origin": "https://jlcpcb.com",
+}
+_OUT_OF_STOCK_STATUSES = {"out", "unavailable", "out_of_stock"}
 logger = structlog.get_logger(__name__)
 
 
@@ -45,9 +73,13 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
         self,
         *,
         base_url: str = LCSC_BASE_URL,
+        api_base_url: str = LCSC_API_BASE_URL,
+        jlcpcb_api_base_url: str = JLCPCB_API_BASE_URL,
         timeout_seconds: float = DEFAULT_READ_TIMEOUT,
     ) -> None:
         self._base_url = base_url.rstrip("/")
+        self._api_base_url = api_base_url.rstrip("/") if api_base_url else ""
+        self._jlcpcb_api_base_url = jlcpcb_api_base_url.rstrip("/") if jlcpcb_api_base_url else ""
         self._timeout_seconds = timeout_seconds
         self._cache: dict[str, list[RawEvidence]] = {}
 
@@ -62,6 +94,15 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
             )
             return list(self._cache[cache_key])
 
+        # Try the JSON API first — it returns structured data for any search term.
+        api_evidence = await self._retrieve_via_api(keys)
+        jlcpcb_evidence = await self._retrieve_jlcpcb_if_needed(keys, api_evidence)
+        if api_evidence or jlcpcb_evidence:
+            combined = list(api_evidence) + list(jlcpcb_evidence)
+            self._cache[cache_key] = combined
+            return combined
+
+        # Fall back to HTML scraping (works for direct product-detail URLs / C-numbers).
         strategies = self._strategies(keys)
         if not strategies:
             self._cache[cache_key] = []
@@ -129,68 +170,613 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
         self._cache[cache_key] = []
         return []
 
+    async def _retrieve_via_api(self, keys: SearchKeys) -> list[RawEvidence]:
+        """Search LCSC's JSON API directly, trying multiple search terms."""
+        search_terms: list[str] = []
+        seen: set[str] = set()
+
+        def _add(term: str) -> None:
+            t = term.strip()
+            if t and t not in seen:
+                seen.add(t)
+                search_terms.append(t)
+
+        # Highest specificity first.
+        _add(keys.lcsc_part_number)
+        _add(keys.mpn)
+        # Parametric / value fallback so footprint-only searches work.
+        focused = str(keys.param_summary or keys.comment).strip()
+        if focused:
+            if keys.footprint:
+                _add(f"{focused} {keys.footprint}")
+            _add(focused)
+
+        if not search_terms or not self._api_base_url:
+            return []
+
+        all_evidence: list[RawEvidence] = []
+        async with httpx.AsyncClient(
+            base_url=self._api_base_url,
+            timeout=build_timeout(self._timeout_seconds),
+            headers=LCSC_API_HEADERS,
+            follow_redirects=True,
+        ) as client:
+            for term in search_terms:
+                logger.debug("lcsc_api_search_attempt", keyword=term)
+                try:
+                    response = await client.get(
+                        LCSC_API_SEARCH_PATH,
+                        params={"keyword": term, "start": 0, "size": LCSC_API_PAGE_SIZE},
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    logger.warning(
+                        "lcsc_api_search_http_error",
+                        keyword=term,
+                        status_code=exc.response.status_code,
+                    )
+                    continue
+                except httpx.RequestError as exc:
+                    logger.warning(
+                        "lcsc_api_search_request_error",
+                        keyword=term,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    continue
+
+                evidence = self._build_api_evidence(response, term)
+                if evidence:
+                    candidate_count = sum(
+                        len(json.loads(ev.raw_content).get("candidates", []))
+                        for ev in evidence
+                        if ev.content_type == "application/json"
+                    )
+                    logger.debug(
+                        "lcsc_api_search_success",
+                        keyword=term,
+                        candidate_count=candidate_count,
+                    )
+                    all_evidence.extend(evidence)
+                    # Stop on the first term that returns results.
+                    break
+
+        return all_evidence
+
+    async def _retrieve_jlcpcb_if_needed(
+        self,
+        keys: SearchKeys,
+        lcsc_evidence: list[RawEvidence],
+    ) -> list[RawEvidence]:
+        """Query JLCPCB for C-numbers that are out of stock on LCSC, or if C-number is known."""
+        if not self._jlcpcb_api_base_url:
+            return []
+
+        c_numbers: list[str] = []
+        seen: set[str] = set()
+
+        def _add_c(c: str) -> None:
+            c = c.strip()
+            if c and c not in seen:
+                seen.add(c)
+                c_numbers.append(c)
+
+        # Always query JLCPCB when we have a known C-number (LCSC/JLCPCB share the namespace).
+        if keys.lcsc_part_number:
+            _add_c(keys.lcsc_part_number)
+
+        # Also check LCSC results: if a part is out of stock there, try JLCPCB.
+        for ev in lcsc_evidence:
+            if ev.content_type != "application/json":
+                continue
+            try:
+                data = json.loads(ev.raw_content)
+            except Exception:
+                continue
+            for candidate in data.get("candidates", []):
+                c_num = self._clean_text(candidate.get("lcsc_part_number") or "")
+                stock_status = self._clean_text(candidate.get("stock_status") or "")
+                stock_qty = candidate.get("stock_qty")
+                is_out = stock_status in _OUT_OF_STOCK_STATUSES or (
+                    isinstance(stock_qty, int) and stock_qty <= 0
+                )
+                if c_num and is_out:
+                    _add_c(c_num)
+            # Single-product evidence (not candidates list).
+            c_num = self._clean_text(data.get("lcsc_part_number") or "")
+            stock_status = self._clean_text(data.get("stock_status") or "")
+            stock_qty = data.get("stock_qty")
+            is_out = stock_status in _OUT_OF_STOCK_STATUSES or (
+                isinstance(stock_qty, int) and stock_qty <= 0
+            )
+            if c_num and is_out:
+                _add_c(c_num)
+
+        if not c_numbers:
+            return []
+
+        return await self._retrieve_from_jlcpcb(c_numbers)
+
+    async def _retrieve_from_jlcpcb(self, c_numbers: list[str]) -> list[RawEvidence]:
+        """Fetch component details from JLCPCB for each C-number."""
+        evidence: list[RawEvidence] = []
+        async with httpx.AsyncClient(
+            base_url=self._jlcpcb_api_base_url,
+            timeout=build_timeout(self._timeout_seconds),
+            headers=JLCPCB_API_HEADERS,
+            follow_redirects=True,
+        ) as client:
+            for c_number in c_numbers:
+                logger.debug("jlcpcb_retrieve_attempt", c_number=c_number)
+                try:
+                    response = await client.get(
+                        JLCPCB_COMPONENT_DETAIL_PATH,
+                        params={"componentCode": c_number},
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    logger.warning(
+                        "jlcpcb_retrieve_http_error",
+                        c_number=c_number,
+                        status_code=exc.response.status_code,
+                    )
+                    continue
+                except httpx.RequestError as exc:
+                    logger.warning(
+                        "jlcpcb_retrieve_request_error",
+                        c_number=c_number,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                    continue
+
+                ev = self._build_jlcpcb_evidence(response, c_number)
+                if ev:
+                    logger.debug(
+                        "jlcpcb_retrieve_success",
+                        c_number=c_number,
+                        status_code=response.status_code,
+                    )
+                    evidence.extend(ev)
+        return evidence
+
+    def _build_jlcpcb_evidence(
+        self, response: httpx.Response, c_number: str
+    ) -> list[RawEvidence]:
+        """Parse a JLCPCB component detail API response into RawEvidence."""
+        try:
+            data = response.json()
+        except Exception:
+            return []
+
+        # JLCPCB wraps the component; try several known nesting structures.
+        component: dict[str, Any] | None = None
+        if isinstance(data, dict):
+            inner = data.get("data") or data.get("result") or data
+            if isinstance(inner, dict):
+                # Some endpoints nest further under smtGoodVo or componentVO.
+                nested = (
+                    inner.get("smtGoodVo")
+                    or inner.get("componentVO")
+                    or inner.get("component")
+                    or inner.get("smtGood")
+                )
+                component = nested if isinstance(nested, dict) else inner
+        logger.debug(
+            "jlcpcb_raw_response",
+            c_number=c_number,
+            component_keys=list(component.keys()) if component else [],
+        )
+
+        if not component:
+            return []
+
+        normalized = self._normalize_jlcpcb_product(component, c_number)
+        if not normalized:
+            return []
+        if not normalized.get("mpn") or not normalized.get("manufacturer"):
+            logger.debug(
+                "jlcpcb_partial_fields",
+                c_number=c_number,
+                has_mpn=bool(normalized.get("mpn")),
+                has_manufacturer=bool(normalized.get("manufacturer")),
+                component_keys=list(component.keys()),
+                component_sample={k: v for k, v in list(component.items())[:20]},
+            )
+
+        raw_content = json.dumps(
+            normalized,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return [
+            RawEvidence(
+                source_url=f"https://jlcpcb.com/partdetail/{c_number}",
+                source_name="JLCPCB",
+                retrieved_at=datetime.now(UTC),
+                content_type="application/json",
+                raw_content=raw_content,
+                search_strategy="jlcpcb_component_detail",
+            )
+        ]
+
+    def _normalize_jlcpcb_product(
+        self, component: dict[str, Any], c_number: str
+    ) -> dict[str, Any] | None:
+        """Map JLCPCB API fields to internal candidate field names."""
+        lcsc_part_number = self._clean_text(
+            component.get("componentCode") or component.get("lcscCode") or c_number
+        )
+        mpn = self._clean_text(
+            component.get("componentModelEn")
+            or component.get("componentModel")
+            or component.get("erpProductName")
+            or component.get("componentName")
+            or component.get("mpn")
+            or component.get("model")
+            or ""
+        )
+        if not lcsc_part_number and not mpn:
+            return None
+
+        manufacturer = self._clean_text(
+            component.get("componentBrandEn")
+            or component.get("brandNameEn")
+            or component.get("componentBrand")
+            or component.get("brandName")
+            or component.get("manufacturer")
+            or component.get("brand")
+            or ""
+        )
+        package = self._clean_text(
+            component.get("componentSpecificationEn")
+            or component.get("componentPackageEn")
+            or component.get("encapStandard")
+            or component.get("package")
+            or component.get("footprint")
+            or ""
+        )
+        description = self._clean_text(
+            component.get("describe")
+            or component.get("componentDescEn")
+            or component.get("productDescEn")
+            or component.get("description")
+            or ""
+        )
+        stock_qty = self._coerce_int(
+            self._first_not_none(component.get("stockCount"), component.get("stock"), component.get("stockNumber"))
+        )
+        overseas_stock = self._coerce_int(component.get("overseasStockCount"))
+        moq = self._coerce_int(
+            component.get("leastNumber")
+            or component.get("minBuyNumber")
+            or component.get("minOrder")
+            or component.get("moq")
+        )
+        category = self._clean_text(
+            component.get("catalogName")
+            or component.get("componentTypeEn")
+            or component.get("category")
+            or ""
+        )
+
+        normalized: dict[str, Any] = {
+            "source_name": "JLCPCB",
+        }
+        if lcsc_part_number:
+            normalized["lcsc_part_number"] = lcsc_part_number
+            normalized["lcsc_link"] = f"https://www.lcsc.com/product-detail/{lcsc_part_number}.html"
+            normalized["jlcpcb_link"] = f"https://jlcpcb.com/partdetail/{lcsc_part_number}"
+            normalized["source_url"] = normalized["jlcpcb_link"]
+        if mpn:
+            normalized["mpn"] = mpn
+            normalized["part_number"] = mpn
+        if manufacturer:
+            normalized["manufacturer"] = manufacturer
+        if package:
+            normalized["package"] = package
+            normalized["footprint"] = package
+        if description:
+            normalized["description"] = description
+            normalized["param_summary"] = description
+        if stock_qty is not None:
+            normalized["stock_qty"] = stock_qty
+            normalized["stock_status"] = self._infer_stock_status_from_quantity(stock_qty)
+        if overseas_stock is not None:
+            normalized["overseas_stock_qty"] = overseas_stock
+        if moq is not None:
+            normalized["moq"] = moq
+        if category:
+            normalized["category"] = category
+
+        # Price tiers — JLCPCB uses various field names.
+        price_list = (
+            component.get("productPriceList")
+            or component.get("priceList")
+            or component.get("prices")
+            or []
+        )
+        if isinstance(price_list, list) and price_list:
+            tiers = []
+            for entry in price_list:
+                if not isinstance(entry, dict):
+                    continue
+                qty = self._coerce_int(entry.get("startNumber") or entry.get("ladder") or entry.get("quantity"))
+                price = self._coerce_float(entry.get("productPrice") or entry.get("usdPrice") or entry.get("price"))
+                if qty is not None and price is not None:
+                    tiers.append({"quantity": qty, "unit_price_usd": price, "currency": "USD"})
+            if tiers:
+                normalized["price_tiers"] = tiers
+                normalized["unit_price_usd"] = tiers[0]["unit_price_usd"]
+                normalized["price_currency"] = "USD"
+
+        return normalized or None
+
+    def _build_api_evidence(self, response: httpx.Response, search_term: str) -> list[RawEvidence]:
+        """Parse an LCSC JSON API response into RawEvidence items."""
+        try:
+            data = response.json()
+        except Exception:
+            return []
+
+        # The LCSC API wraps results: {"code": 200, "result": {"productList": [...], "totalCount": N}}
+        product_list: list[Any] = []
+        if isinstance(data, list):
+            product_list = data
+        elif isinstance(data, dict):
+            result = data.get("result") or data.get("data") or data
+            if isinstance(result, list):
+                product_list = result
+            elif isinstance(result, dict):
+                for key in ("productList", "products", "list", "items"):
+                    value = result.get(key)
+                    if isinstance(value, list):
+                        product_list = value
+                        break
+                if not product_list:
+                    # Treat result itself as a single product dict.
+                    product_list = [result]
+
+        if not product_list:
+            logger.debug("lcsc_api_search_empty_result", keyword=search_term)
+            return []
+
+        candidates = [
+            normalized
+            for product in product_list
+            if isinstance(product, dict)
+            for normalized in [self._normalize_api_product(product, search_term=search_term)]
+            if normalized
+        ]
+        if not candidates:
+            return []
+
+        raw_content = json.dumps(
+            {"candidates": candidates},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return [
+            RawEvidence(
+                source_url=str(response.url),
+                source_name="LCSC",
+                retrieved_at=datetime.now(UTC),
+                content_type="application/json",
+                raw_content=raw_content,
+                search_strategy="lcsc_api_search",
+            )
+        ]
+
+    def _normalize_api_product(
+        self,
+        product: dict[str, Any],
+        *,
+        search_term: str = "",
+    ) -> dict[str, Any] | None:
+        """Convert LCSC API product fields to the internal candidate field names."""
+        lcsc_part_number = self._clean_text(
+            product.get("productCode") or product.get("lcscCode") or product.get("sku") or ""
+        )
+        mpn = self._clean_text(
+            product.get("productModel") or product.get("mpn") or product.get("model") or ""
+        )
+        if not lcsc_part_number and not mpn:
+            return None
+
+        manufacturer = self._clean_text(
+            product.get("brandNameEn") or product.get("brandName") or product.get("manufacturer") or ""
+        )
+        package = self._clean_text(
+            product.get("encapStandard") or product.get("package") or product.get("footprint") or ""
+        )
+        description = self._clean_text(
+            product.get("productDescEn")
+            or product.get("productDesc")
+            or product.get("description")
+            or product.get("title")
+            or ""
+        )
+        stock_qty = self._coerce_int(
+            self._first_not_none(product.get("stockNumber"), product.get("stockCount"), product.get("stock"))
+        )
+        product_cycle = self._clean_text(
+            product.get("productCycle") or product.get("lifecycle") or ""
+        )
+        lifecycle_status = self._normalize_product_cycle(product_cycle)
+        catalog = self._clean_text(product.get("catalogName") or product.get("category") or "")
+        parent_catalog = self._clean_text(product.get("parentCatalogName") or "")
+        category = f"{parent_catalog}/{catalog}" if parent_catalog and catalog else catalog
+
+        normalized: dict[str, Any] = {}
+        if lcsc_part_number:
+            normalized["lcsc_part_number"] = lcsc_part_number
+            normalized["lcsc_link"] = f"https://www.lcsc.com/product-detail/{lcsc_part_number}.html"
+            normalized["source_url"] = normalized["lcsc_link"]
+        if mpn:
+            normalized["mpn"] = mpn
+            normalized["part_number"] = mpn
+        if manufacturer:
+            normalized["manufacturer"] = manufacturer
+        if package:
+            normalized["package"] = package
+            normalized["footprint"] = package
+        if description:
+            normalized["description"] = description
+            normalized["param_summary"] = description
+            normalized["value_summary"] = description
+        if stock_qty is not None:
+            normalized["stock_qty"] = stock_qty
+            normalized["stock_status"] = self._infer_stock_status_from_quantity(stock_qty)
+        if lifecycle_status:
+            normalized["lifecycle_status"] = lifecycle_status
+        if category:
+            normalized["category"] = category
+
+        # Price tiers — accept multiple field names.
+        price_list = (
+            product.get("productPriceList")
+            or product.get("priceList")
+            or product.get("prices")
+            or []
+        )
+        if isinstance(price_list, list) and price_list:
+            first = price_list[0]
+            if isinstance(first, dict):
+                price = self._coerce_float(
+                    first.get("usdPrice") or first.get("price") or first.get("unitPrice")
+                )
+                if price is not None:
+                    normalized["unit_price_usd"] = price
+                    normalized["price_currency"] = "USD"
+
+        return normalized or None
+
     def _strategies(self, keys: SearchKeys) -> list[tuple[str, dict[str, Any]]]:
         strategies: list[tuple[str, dict[str, Any]]] = []
+        seen_requests: set[tuple[str, str]] = set()
+        fallback_params = self._fallback_params(keys)
+
+        def add_strategy(
+            strategy_name: str,
+            *,
+            path: str,
+            params: Mapping[str, Any] | None = None,
+        ) -> None:
+            normalized_params = {
+                str(key): str(value)
+                for key, value in (params or {}).items()
+                if str(value).strip()
+            }
+            fingerprint = (
+                path,
+                json.dumps(normalized_params, ensure_ascii=True, sort_keys=True),
+            )
+            if fingerprint in seen_requests:
+                return
+            seen_requests.add(fingerprint)
+            request: dict[str, Any] = {"path": path}
+            if normalized_params:
+                request["params"] = normalized_params
+            strategies.append((strategy_name, request))
+
         if keys.lcsc_part_number:
-            strategies.append(
-                (
-                    "lcsc_product_detail",
-                    {
-                        "path": LCSC_PRODUCT_DETAIL_PATH.format(
-                            part_number=keys.lcsc_part_number,
-                        ),
-                    },
-                )
+            add_strategy(
+                "lcsc_product_detail",
+                path=LCSC_PRODUCT_DETAIL_PATH.format(
+                    part_number=keys.lcsc_part_number,
+                ),
             )
             if keys.source_url:
-                strategies.append(
-                    (
-                        "source_url",
-                        {
-                            "path": keys.source_url,
-                        },
-                    )
+                add_strategy("source_url", path=keys.source_url)
+            add_strategy(
+                "lcsc_part_number",
+                path=LCSC_SEARCH_PATH,
+                params={"searchTerm": keys.lcsc_part_number},
+            )
+            if keys.mpn:
+                add_strategy(
+                    "mpn",
+                    path=LCSC_SEARCH_PATH,
+                    params={"searchTerm": keys.mpn},
                 )
-            strategies.append(
-                (
-                    "lcsc_part_number",
-                    {
-                        "path": LCSC_SEARCH_PATH,
-                        "params": {"searchTerm": keys.lcsc_part_number},
-                    },
-                )
+            self._append_search_fallback_strategies(
+                strategies,
+                add_strategy,
+                keys,
+                fallback_params=fallback_params,
             )
             return strategies
         if keys.mpn:
-            strategies.append(
-                (
-                    "mpn",
-                    {
-                        "path": LCSC_SEARCH_PATH,
-                        "params": {"searchTerm": keys.mpn},
-                    },
-                )
+            add_strategy(
+                "mpn",
+                path=LCSC_SEARCH_PATH,
+                params={"searchTerm": keys.mpn},
             )
             if keys.source_url:
-                strategies.append(
-                    (
-                        "source_url",
-                        {
-                            "path": keys.source_url,
-                        },
-                    )
-                )
+                add_strategy("source_url", path=keys.source_url)
+            self._append_search_fallback_strategies(
+                strategies,
+                add_strategy,
+                keys,
+                fallback_params=fallback_params,
+            )
             return strategies
         if keys.source_url:
-            return [
-                (
-                    "source_url",
-                    {
-                        "path": keys.source_url,
-                    },
-                )
-            ]
+            add_strategy("source_url", path=keys.source_url)
+            self._append_search_fallback_strategies(
+                strategies,
+                add_strategy,
+                keys,
+                fallback_params=fallback_params,
+            )
+            return strategies
 
+        self._append_search_fallback_strategies(
+            strategies,
+            add_strategy,
+            keys,
+            fallback_params=fallback_params,
+        )
+        return strategies
+
+    def _append_search_fallback_strategies(
+        self,
+        strategies: list[tuple[str, dict[str, Any]]],
+        add_strategy: Any,
+        keys: SearchKeys,
+        *,
+        fallback_params: Mapping[str, Any],
+    ) -> None:
+        del strategies
+        if fallback_params:
+            add_strategy(
+                "parametric_fallback",
+                path=LCSC_SEARCH_PATH,
+                params=fallback_params,
+            )
+
+        value_footprint_term = self._value_footprint_search_term(keys)
+        if value_footprint_term:
+            add_strategy(
+                "value_footprint_search",
+                path=LCSC_SEARCH_PATH,
+                params={"searchTerm": value_footprint_term},
+            )
+
+        for strategy_name, value in (
+            ("comment_search", keys.comment),
+            ("param_summary_search", keys.param_summary),
+        ):
+            term = str(value).strip()
+            if not term:
+                continue
+            add_strategy(
+                strategy_name,
+                path=LCSC_SEARCH_PATH,
+                params={"searchTerm": term},
+            )
+
+    def _fallback_params(self, keys: SearchKeys) -> dict[str, str]:
         params: dict[str, str] = {}
         if keys.category:
             params["category"] = keys.category
@@ -198,17 +784,16 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
             params["footprint"] = keys.footprint
         if keys.param_summary:
             params["param_summary"] = keys.param_summary
+        elif keys.comment:
+            params["param_summary"] = keys.comment
+        return params
 
-        if not params:
-            return []
-
-        return [(
-            "parametric_fallback",
-            {
-                "path": LCSC_SEARCH_PATH,
-                "params": params,
-            },
-        )]
+    def _value_footprint_search_term(self, keys: SearchKeys) -> str:
+        summary = str(keys.param_summary or keys.comment).strip()
+        footprint = str(keys.footprint).strip()
+        if not summary or not footprint:
+            return ""
+        return f"{summary} {footprint}"
 
     def _build_evidence(
         self,
@@ -277,10 +862,7 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
                 ),
                 "application/json",
             )
-
-        if self._looks_like_generic_search_shell(content):
-            return "", normalized_type or "text/html"
-        return content, normalized_type or "text/html"
+        return "", normalized_type or "text/html"
 
     def _extract_product_payload_from_html(
         self,
@@ -733,6 +1315,13 @@ class LcscEvidenceRetriever(IEvidenceRetriever):
         if stock_qty <= 100:
             return "medium"
         return "high"
+
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        for v in values:
+            if v is not None:
+                return v
+        return None
 
     def _coerce_int(self, value: Any) -> int | None:
         if isinstance(value, bool):

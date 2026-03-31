@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSplitter,
     QVBoxLayout,
 )
 
@@ -46,6 +47,7 @@ class ImportPage(SimplePage):
             "Drop CSV files here or use the browse buttons",
             intake_card,
         )
+        self.drop_zone.setMinimumHeight(220)
         self.drop_zone.files_dropped.connect(self._handle_dropped_files)
 
         hint = QLabel(
@@ -64,6 +66,7 @@ class ImportPage(SimplePage):
         self.browse_folder_button.clicked.connect(self._browse_folder)
         button_row.addWidget(self.browse_files_button)
         button_row.addWidget(self.browse_folder_button)
+        button_row.addStretch(1)
 
         intake_layout.addWidget(self.drop_zone)
         intake_layout.addWidget(hint)
@@ -74,13 +77,21 @@ class ImportPage(SimplePage):
         self.recent_imports_list.setSelectionMode(
             QListWidget.SelectionMode.NoSelection
         )
+        self.recent_imports_list.setMinimumHeight(220)
         self.recent_imports_list.setFrameShape(QFrame.Shape.NoFrame)
         recent_layout = recent_card.layout()
         if recent_layout is not None:
             recent_layout.addWidget(self.recent_imports_list)
 
-        self.content_layout.addWidget(intake_card)
-        self.content_layout.addWidget(recent_card)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.addWidget(intake_card)
+        self.workspace_splitter.addWidget(recent_card)
+        self.workspace_splitter.setStretchFactor(0, 3)
+        self.workspace_splitter.setStretchFactor(1, 2)
+        self.workspace_splitter.setSizes([720, 460])
+
+        self.content_layout.addWidget(self.workspace_splitter, 1)
         self.set_recent_imports([])
 
     def set_recent_imports(

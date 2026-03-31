@@ -7,6 +7,8 @@ from typing import Any
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractScrollArea,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from . import SimplePage, create_card
+from . import SimplePage, configure_data_table, create_card
 
 
 class BomTableModel(QAbstractTableModel):
@@ -168,20 +170,37 @@ class BomTablePage(SimplePage):
         self.table_view = QTableView(self)
         self.table_view.setObjectName("BomTableView")
         self.table_view.setModel(self.table_model)
+        self.table_view.setSizeAdjustPolicy(
+            QAbstractScrollArea.SizeAdjustPolicy.AdjustToContentsOnFirstShow
+        )
         self.table_view.setSelectionBehavior(
             QTableView.SelectionBehavior.SelectRows
         )
         self.table_view.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
         self.table_view.setAlternatingRowColors(True)
+        self.table_view.setShowGrid(False)
         self.table_view.setSortingEnabled(False)
         self.table_view.verticalHeader().setVisible(False)
+        configure_data_table(
+            self.table_view,
+            stretch_column=6,
+            minimum_height=360,
+            default_section_size=150,
+            minimum_section_size=84,
+        )
+        self.table_view.verticalHeader().setDefaultSectionSize(38)
         header = self.table_view.horizontalHeader()
-        header.setStretchLastSection(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_view.setColumnWidth(3, 140)
+        self.table_view.setColumnWidth(4, 150)
         self.table_view.selectionModel().currentRowChanged.connect(
             self._handle_current_row_changed
         )
@@ -197,7 +216,7 @@ class BomTablePage(SimplePage):
 
         self.content_layout.addWidget(summary)
         self.content_layout.addLayout(action_row)
-        self.content_layout.addWidget(self.table_view)
+        self.content_layout.addWidget(self.table_view, 1)
         self.content_layout.addWidget(self.empty_state)
 
     def set_rows(self, rows: Sequence[Mapping[str, Any] | Any]) -> None:

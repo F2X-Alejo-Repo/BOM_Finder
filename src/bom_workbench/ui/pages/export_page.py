@@ -75,6 +75,16 @@ class ExportPage(SimplePage):
             checkbox.setChecked(True)
             options_layout.addWidget(checkbox)
 
+        overview_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self)
+        overview_splitter.setChildrenCollapsible(False)
+        overview_splitter.addWidget(target_card)
+        overview_splitter.addWidget(columns)
+        overview_splitter.addWidget(options_card)
+        overview_splitter.setStretchFactor(0, 2)
+        overview_splitter.setStretchFactor(1, 2)
+        overview_splitter.setStretchFactor(2, 2)
+        overview_splitter.setSizes([320, 280, 320])
+
         self.export_button = QtWidgets.QPushButton("Export to File...", self)
         self.export_button.clicked.connect(self._emit_export_requested)
 
@@ -87,9 +97,7 @@ class ExportPage(SimplePage):
         self.last_result_label.setWordWrap(True)
         self.last_result_label.setObjectName("ExportResult")
 
-        self.content_layout.addWidget(target_card)
-        self.content_layout.addWidget(columns)
-        self.content_layout.addWidget(options_card)
+        self.content_layout.addWidget(overview_splitter)
         self.content_layout.addWidget(self.export_button)
         self.content_layout.addWidget(self.status_label)
         self.content_layout.addWidget(self.last_result_label)

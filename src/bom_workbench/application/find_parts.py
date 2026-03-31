@@ -100,6 +100,15 @@ class SearchKeyResolution:
 
 
 @dataclass(slots=True, frozen=True)
+class SearchPlanStep:
+    """One deterministic retrieval step in the replacement search plan."""
+
+    label: str
+    search_keys: SearchKeys
+    stop_if_candidates_at_least: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class ReplacementSearchResult:
     """Ranked replacement candidate returned to the caller."""
 
@@ -523,7 +532,10 @@ class GroundedPartFinderSearchStage:
             "Use only the supplied BOM row, explicit criteria, resolved search keys, and reference candidates.",
             "Generate search leads, not final replacement claims.",
             "Treat keep_same_footprint, keep_same_manufacturer, and minimum_stock_qty as hard constraints.",
+            "Prefer same value and same footprint first, like a sourcing engineer would.",
+            "Electrical value equivalence is mandatory: do not confuse different resistor or capacitor values just because package or stock looks attractive.",
             "Prefer exact MPNs or LCSC part numbers that are likely broadly available on LCSC.",
+            "If minimum_stock_qty is set, only suggest leads that are likely to satisfy that numeric threshold from grounded supplier evidence.",
             "If you are uncertain, return fewer leads instead of inventing options.",
             "Return at most 5 leads and only data that matches the schema.",
         ]
@@ -1001,6 +1013,7 @@ class ReplacementConfirmationRequired(PermissionError):
 class FindPartsUseCase:
     """Search, rank, and apply part replacements deterministically."""
 
+    _BROAD_FALLBACK_THRESHOLD = 3
     _PRIMARY_SEARCH_FIELDS: tuple[str, ...] = (
         "lcsc_part_number",
         "mpn",
@@ -1051,7 +1064,8 @@ class FindPartsUseCase:
         if not search_resolution.primary_value:
             return []
 
-        evidence = list(await self._retriever.retrieve(search_resolution.search_keys))
+        search_plan = self._build_search_plan(search_resolution.search_keys)
+        evidence = await self._retrieve_search_plan_evidence(search_plan)
         initial_candidates = self._parse_candidates(evidence)
         if self._llm_search_stage is not None:
             evidence = await self._expand_evidence_with_llm(
@@ -1082,7 +1096,25 @@ class FindPartsUseCase:
                     "match_explanation": explanation,
                 }
             )
-            if not self._candidate_matches_filters(ranked_candidate, criteria_model, context_row):
+            rejection_reasons = self._candidate_filter_rejection_reasons(
+                ranked_candidate,
+                criteria_model,
+                context_row,
+            )
+            if rejection_reasons:
+                logger.info(
+                    "part_finder_candidate_filtered_out",
+                    row_id=int(context_row.id or 0),
+                    project_id=int(context_row.project_id or 0),
+                    candidate_mpn=self._clean_text(ranked_candidate.mpn),
+                    candidate_lcsc_part_number=self._clean_text(ranked_candidate.lcsc_part_number),
+                    candidate_stock_qty=ranked_candidate.stock_qty,
+                    candidate_stock_status=self._clean_text(ranked_candidate.stock_status),
+                    candidate_footprint=self._clean_text(ranked_candidate.footprint),
+                    candidate_package=self._clean_text(ranked_candidate.package),
+                    candidate_value_summary=self._clean_text(ranked_candidate.value_summary),
+                    reasons=rejection_reasons,
+                )
                 continue
             results.append(
                 ReplacementSearchResult(
@@ -1210,8 +1242,11 @@ class FindPartsUseCase:
         )
         param_summary = self._first_non_empty(
             criteria_data.get("param_summary", ""),
+            criteria_data.get("comment", ""),
             self._row_value(row, "param_summary"),
+            self._row_value(row, "comment"),
             criteria_data.get("value", ""),
+            self._row_value(row, "value_raw"),
         )
 
         resolved = SearchKeys(
@@ -1230,6 +1265,85 @@ class FindPartsUseCase:
             primary_value=primary_value,
             priority_order=self._PRIMARY_SEARCH_FIELDS,
         )
+
+    def _build_search_plan(self, search_keys: SearchKeys) -> list[SearchPlanStep]:
+        plan: list[SearchPlanStep] = []
+        seen_fingerprints: set[str] = set()
+
+        def add_step(
+            label: str,
+            step_keys: SearchKeys,
+            *,
+            stop_if_candidates_at_least: int | None = None,
+        ) -> None:
+            fingerprint = self._search_keys_fingerprint(step_keys)
+            if not fingerprint or fingerprint in seen_fingerprints:
+                return
+            seen_fingerprints.add(fingerprint)
+            plan.append(
+                SearchPlanStep(
+                    label=label,
+                    search_keys=step_keys,
+                    stop_if_candidates_at_least=stop_if_candidates_at_least,
+                )
+            )
+
+        if any(
+            self._clean_text(value)
+            for value in (
+                search_keys.lcsc_part_number,
+                search_keys.mpn,
+                search_keys.source_url,
+            )
+        ):
+            add_step(
+                "exact_reference",
+                SearchKeys(
+                    lcsc_part_number=search_keys.lcsc_part_number,
+                    mpn=search_keys.mpn,
+                    source_url=search_keys.source_url,
+                ),
+            )
+
+        focused_summary = self._first_non_empty(
+            search_keys.param_summary,
+            search_keys.comment,
+        )
+        if focused_summary:
+            add_step(
+                "value_footprint",
+                SearchKeys(
+                    comment=focused_summary,
+                    footprint=search_keys.footprint,
+                    category=search_keys.category,
+                    param_summary=focused_summary,
+                ),
+                stop_if_candidates_at_least=self._BROAD_FALLBACK_THRESHOLD,
+            )
+            add_step(
+                "broad_text",
+                SearchKeys(
+                    comment=focused_summary,
+                    category=search_keys.category,
+                    param_summary=focused_summary,
+                ),
+            )
+        return plan
+
+    async def _retrieve_search_plan_evidence(
+        self,
+        search_plan: Sequence[SearchPlanStep],
+    ) -> list[RawEvidence]:
+        merged_evidence: list[RawEvidence] = []
+        for step in search_plan:
+            step_evidence = list(await self._retriever.retrieve(step.search_keys))
+            if step_evidence:
+                merged_evidence = self._merge_raw_evidence(merged_evidence, step_evidence)
+            if step.stop_if_candidates_at_least is None:
+                continue
+            if len(self._parse_candidates(merged_evidence)) >= step.stop_if_candidates_at_least:
+                break
+        return merged_evidence
 
     async def _resolve_context_row(
         self,
@@ -1274,8 +1388,11 @@ class FindPartsUseCase:
         row.category = self._first_non_empty(criteria_data.get("category", ""), row.category)
         row.param_summary = self._first_non_empty(
             criteria_data.get("param_summary", ""),
+            criteria_data.get("comment", ""),
             row.param_summary,
+            row.comment,
             criteria_data.get("value", ""),
+            row.value_raw,
         )
         row.manufacturer = self._first_non_empty(
             criteria_data.get("manufacturer", ""),
@@ -1377,9 +1494,27 @@ class FindPartsUseCase:
             self._extract_text(payload, "lifecycle_status", "lifecycle", "status")
         )
 
+        raw_part_number = self._extract_text(payload, "part_number")
+        raw_lcsc_part_number = self._extract_text(payload, "lcsc_part_number")
+        lcsc_part_number = self._first_non_empty(
+            raw_lcsc_part_number
+            if self._looks_like_lcsc_part_number(raw_lcsc_part_number)
+            else "",
+            raw_part_number if self._looks_like_lcsc_part_number(raw_part_number) else "",
+        )
+        part_number = self._first_non_empty(
+            raw_part_number,
+            raw_lcsc_part_number,
+            self._extract_text(payload, "mpn"),
+        )
+        mpn = self._first_non_empty(
+            self._extract_text(payload, "mpn", "manufacturer_part_number"),
+            "" if self._looks_like_lcsc_part_number(part_number) else part_number,
+        )
+
         candidate = ReplacementCandidate(
             manufacturer=self._extract_text(payload, "manufacturer", "brand", "vendor"),
-            mpn=self._extract_text(payload, "mpn", "manufacturer_part_number", "part_number"),
+            mpn=mpn,
             footprint=self._extract_text(payload, "footprint"),
             package=self._extract_text(payload, "package", "pkg"),
             value_summary=self._extract_text(
@@ -1391,7 +1526,7 @@ class FindPartsUseCase:
                 "param_summary",
             ),
             lcsc_link=self._extract_text(payload, "lcsc_link", "source_url", "url", "link"),
-            lcsc_part_number=self._extract_text(payload, "lcsc_part_number", "part_number"),
+            lcsc_part_number=lcsc_part_number,
             stock_qty=stock_qty,
             lifecycle_status=lifecycle_status,
             confidence=self._extract_confidence(payload),
@@ -1400,7 +1535,7 @@ class FindPartsUseCase:
             differences=self._extract_text(payload, "differences"),
             warnings=self._extract_warnings(payload),
             evidence=[evidence_record],
-            part_number=self._extract_text(payload, "part_number", "lcsc_part_number", "mpn"),
+            part_number=part_number,
             description=self._extract_text(payload, "description", "summary", "value_summary"),
             stock_status=stock_status,
         )
@@ -1594,7 +1729,11 @@ class FindPartsUseCase:
         return SearchKeys(
             lcsc_part_number=lead_lcsc,
             mpn=lead_mpn,
-            source_url="",
+            source_url=self._first_non_empty(
+                self._compatible_search_source_url(criteria.source_url, lead_lcsc, lead_mpn),
+                self._compatible_search_source_url(context_row.source_url, lead_lcsc, lead_mpn),
+                self._compatible_search_source_url(context_row.lcsc_link, lead_lcsc, lead_mpn),
+            ),
             comment=self._first_non_empty(
                 criteria.comment,
                 criteria.value,
@@ -1622,6 +1761,32 @@ class FindPartsUseCase:
             ),
         )
 
+    def _merge_raw_evidence(
+        self,
+        left: Sequence[RawEvidence],
+        right: Sequence[RawEvidence],
+    ) -> list[RawEvidence]:
+        merged: list[RawEvidence] = []
+        seen: set[str] = set()
+        for record in [*left, *right]:
+            fingerprint = json.dumps(
+                {
+                    "source_url": self._clean_text(record.source_url),
+                    "source_name": self._clean_text(record.source_name),
+                    "content_type": self._clean_text(record.content_type),
+                    "raw_content": self._clean_text(record.raw_content),
+                    "search_strategy": self._clean_text(record.search_strategy),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(record)
+        return merged
+
     def _search_keys_fingerprint(self, search_keys: SearchKeys) -> str:
         if not any(
             self._clean_text(value)
@@ -1643,29 +1808,92 @@ class FindPartsUseCase:
             sort_keys=True,
         )
 
+    def _compatible_search_source_url(
+        self,
+        source_url: str,
+        lcsc_part_number: str,
+        mpn: str,
+    ) -> str:
+        normalized_url = self._clean_text(source_url)
+        if not normalized_url:
+            return ""
+        lowered_url = normalized_url.casefold()
+        if any(token in lowered_url for token in ("/search", "componentsearch", "/parts")):
+            return normalized_url
+        for identifier in (self._clean_text(lcsc_part_number), self._clean_text(mpn)):
+            if identifier and identifier.casefold() in lowered_url:
+                return normalized_url
+        if not self._clean_text(lcsc_part_number) and not self._clean_text(mpn):
+            return normalized_url
+        return ""
+
     def _candidate_matches_filters(
         self,
         candidate: ReplacementCandidate,
         criteria: PartSearchCriteria,
         context_row: BomRow,
     ) -> bool:
-        if criteria.active_only and self._is_risky_lifecycle(candidate.lifecycle_status):
-            return False
+        return not self._candidate_filter_rejection_reasons(candidate, criteria, context_row)
+
+    def _candidate_filter_rejection_reasons(
+        self,
+        candidate: ReplacementCandidate,
+        criteria: PartSearchCriteria,
+        context_row: BomRow,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if criteria.active_only and self._is_non_active_lifecycle(candidate.lifecycle_status):
+            reasons.append("active_only")
         if criteria.in_stock and self._is_out_of_stock(candidate):
-            return False
+            reasons.append("in_stock")
         if criteria.lcsc_available and not self._candidate_has_lcsc_availability(candidate):
-            return False
+            reasons.append("lcsc_available")
         if criteria.minimum_stock_qty is not None:
-            if candidate.stock_qty is None or candidate.stock_qty < criteria.minimum_stock_qty:
-                return False
+            if not self._meets_minimum_stock_qty(candidate, criteria.minimum_stock_qty):
+                reasons.append(f"minimum_stock_qty:{criteria.minimum_stock_qty}")
         if criteria.keep_same_footprint and not self._matches_same_footprint(context_row, candidate):
-            return False
+            reasons.append("keep_same_footprint")
         if criteria.keep_same_manufacturer and not self._matches_same_manufacturer(
             context_row,
             candidate,
         ):
+            reasons.append("keep_same_manufacturer")
+        return reasons
+
+    def _is_non_active_lifecycle(self, lifecycle_status: LifecycleStatus | str) -> bool:
+        normalized = self._normalize_lifecycle_status(lifecycle_status)
+        return normalized in {
+            LifecycleStatus.NRND.value,
+            LifecycleStatus.LAST_TIME_BUY.value,
+            LifecycleStatus.EOL.value,
+        }
+
+    def _meets_minimum_stock_qty(
+        self,
+        candidate: ReplacementCandidate,
+        minimum_stock_qty: int,
+    ) -> bool:
+        if minimum_stock_qty <= 0:
+            return True
+        if candidate.stock_qty is not None:
+            return candidate.stock_qty >= minimum_stock_qty
+        estimated_floor = self._estimated_stock_qty_floor(candidate)
+        if estimated_floor is None:
             return False
-        return True
+        return estimated_floor >= minimum_stock_qty
+
+    def _estimated_stock_qty_floor(
+        self,
+        candidate: ReplacementCandidate,
+    ) -> int | None:
+        stock_status = self._normalize_stock_status(candidate.stock_status)
+        floors = {
+            "high": 1_000,
+            "medium": 100,
+            "low": 10,
+            "out": 0,
+        }
+        return floors.get(stock_status)
 
     async def _rerank_with_llm(
         self,
@@ -1993,8 +2221,8 @@ class FindPartsUseCase:
         return "" if prefer_lcsc else part_number
 
     def _looks_like_lcsc_part_number(self, value: str) -> bool:
-        normalized = self._normalize_key(value)
-        return normalized.startswith("c") and any(char.isdigit() for char in normalized)
+        text = self._clean_text(value).upper()
+        return bool(re.fullmatch(r"C\d{3,}", text))
 
     def _first_non_empty(self, *values: object) -> str:
         for value in values:
