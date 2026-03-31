@@ -27,6 +27,12 @@ class ExportPage(SimplePage):
         self.procurement_target = QtWidgets.QRadioButton(
             "Final procurement BOM", target_card
         )
+        self.jlcpcb_target = QtWidgets.QRadioButton(
+            "JLCPCB assembly BOM", target_card
+        )
+        self.jlcpcb_cpl_target = QtWidgets.QRadioButton(
+            "JLCPCB CPL (pick-and-place)", target_card
+        )
         self.full_table_target = QtWidgets.QRadioButton(
             "Full canonical table", target_card
         )
@@ -35,9 +41,13 @@ class ExportPage(SimplePage):
         )
         self.procurement_target.setChecked(True)
         self.target_group.addButton(self.procurement_target)
+        self.target_group.addButton(self.jlcpcb_target)
+        self.target_group.addButton(self.jlcpcb_cpl_target)
         self.target_group.addButton(self.full_table_target)
         self.target_group.addButton(self.current_view_target)
         target_layout.addWidget(self.procurement_target)
+        target_layout.addWidget(self.jlcpcb_target)
+        target_layout.addWidget(self.jlcpcb_cpl_target)
         target_layout.addWidget(self.full_table_target)
         target_layout.addWidget(self.current_view_target)
 
@@ -148,6 +158,10 @@ class ExportPage(SimplePage):
         self.export_requested.emit(payload)
 
     def _selected_target(self) -> str:
+        if self.jlcpcb_target.isChecked():
+            return "jlcpcb_assembly_bom"
+        if self.jlcpcb_cpl_target.isChecked():
+            return "jlcpcb_cpl"
         if self.full_table_target.isChecked():
             return "full_table"
         if self.current_view_target.isChecked():

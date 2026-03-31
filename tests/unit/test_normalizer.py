@@ -93,7 +93,7 @@ def test_whitespace_only_fields_are_cleaned() -> None:
     normalized = result.rows[0]
     assert normalized.designator == ""
     assert normalized.comment == ""
-    assert normalized.footprint == "R_0402"
+    assert normalized.footprint == "0402"  # footprint normalizer extracts IPC package code
 
 
 def test_long_values_are_truncated_by_service() -> None:

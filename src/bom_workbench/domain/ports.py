@@ -9,7 +9,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from pydantic import BaseModel
 
-from .entities import BomProject, BomRow, Job, ProviderConfig
+from .entities import BomProject, BomRow, CplEntry, Job, ProviderConfig
 from .enums import JobState
 
 __all__ = [
@@ -185,6 +185,14 @@ class IBomRepository(Protocol):
 
     async def delete_row(self, row_id: int) -> None: ...
 
+    async def save_cpl_entries(
+        self, entries: list[CplEntry], project_id: int
+    ) -> list[CplEntry]: ...
+
+    async def list_cpl_entries(self, project_id: int) -> list[CplEntry]: ...
+
+    async def delete_cpl_entries(self, project_id: int) -> None: ...
+
 
 @runtime_checkable
 class IJobRepository(Protocol):
@@ -226,6 +234,13 @@ class IExporter(Protocol):
     """Export port for workbook generation."""
 
     async def export_procurement_bom(
+        self,
+        rows: Sequence[BomRow],
+        output_path: Path,
+        options: ExportOptions,
+    ) -> ExportResult: ...
+
+    async def export_jlcpcb_assembly_bom(
         self,
         rows: Sequence[BomRow],
         output_path: Path,

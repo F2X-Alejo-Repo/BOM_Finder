@@ -1,0 +1,306 @@
+"""Unit tests for CplParser."""
+
+from __future__ import annotations
+
+import pytest
+
+from bom_workbench.domain.entities import CplEntry
+from bom_workbench.infrastructure.csv.cpl_parser import CplParseResult, CplParser
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_parser() -> CplParser:
+    return CplParser()
+
+
+def _parse(text: str, project_id: int = 1) -> CplParseResult:
+    return _make_parser().parse_text(text, project_id=project_id)
+
+
+# ---------------------------------------------------------------------------
+# Basic parsing – KiCad standard column names
+# ---------------------------------------------------------------------------
+
+KICAD_STANDARD_CSV = """\
+Ref,Val,Package,PosX,PosY,Rot,Side
+C1,100nF,C_0603,10.0,20.0,0,top
+R1,10k,R_0402,-5.5,3.2,90,bottom
+U1,STM32,LQFP-64,0.0,0.0,180,top
+"""
+
+
+def test_parse_standard_kicad_csv():
+    result = _parse(KICAD_STANDARD_CSV)
+    assert len(result.entries) == 3
+    assert result.warnings == []
+    assert result.skipped_rows == 0
+
+
+def test_parse_designators():
+    result = _parse(KICAD_STANDARD_CSV)
+    designators = [e.designator for e in result.entries]
+    assert designators == ["C1", "R1", "U1"]
+
+
+def test_parse_positions():
+    result = _parse(KICAD_STANDARD_CSV)
+    c1 = result.entries[0]
+    assert c1.x_pos == pytest.approx(10.0)
+    assert c1.y_pos == pytest.approx(20.0)
+
+
+def test_parse_rotation():
+    result = _parse(KICAD_STANDARD_CSV)
+    r1 = result.entries[1]
+    assert r1.rotation == pytest.approx(90.0)
+
+
+def test_parse_project_id_assigned():
+    result = _parse(KICAD_STANDARD_CSV, project_id=42)
+    for entry in result.entries:
+        assert entry.project_id == 42
+
+
+# ---------------------------------------------------------------------------
+# Layer normalization
+# ---------------------------------------------------------------------------
+
+LAYER_VARIANTS_CSV = """\
+Ref,PosX,PosY,Rot,Side
+C1,0,0,0,top
+C2,0,0,0,Top
+C3,0,0,0,T
+C4,0,0,0,F
+C5,0,0,0,front
+C6,0,0,0,F.Cu
+R1,0,0,0,bottom
+R2,0,0,0,Bottom
+R3,0,0,0,B
+R4,0,0,0,b.cu
+"""
+
+
+@pytest.mark.parametrize("idx,expected_layer", [
+    (0, "Top"),
+    (1, "Top"),
+    (2, "Top"),
+    (3, "Top"),
+    (4, "Top"),
+    (5, "Top"),
+    (6, "Bottom"),
+    (7, "Bottom"),
+    (8, "Bottom"),
+    (9, "Bottom"),
+])
+def test_layer_normalization(idx: int, expected_layer: str):
+    result = _parse(LAYER_VARIANTS_CSV)
+    assert result.entries[idx].layer == expected_layer
+
+
+# ---------------------------------------------------------------------------
+# Column alias variants
+# ---------------------------------------------------------------------------
+
+JLCPCB_STYLE_CSV = """\
+Designator,Mid X,Mid Y,Rotation,Layer
+D1,1.0,2.0,45,Top
+D2,3.0,4.0,0,Bottom
+"""
+
+
+def test_jlcpcb_column_aliases():
+    result = _parse(JLCPCB_STYLE_CSV)
+    assert len(result.entries) == 2
+    assert result.entries[0].designator == "D1"
+    assert result.entries[0].x_pos == pytest.approx(1.0)
+    assert result.entries[0].rotation == pytest.approx(45.0)
+
+
+REFERENCE_COLUMN_CSV = """\
+Reference,Center-X(mm),Center-Y(mm),Angle,TB
+Q1,5.0,6.0,90,Top
+"""
+
+
+def test_reference_and_angle_aliases():
+    result = _parse(REFERENCE_COLUMN_CSV)
+    assert len(result.entries) == 1
+    q1 = result.entries[0]
+    assert q1.designator == "Q1"
+    assert q1.rotation == pytest.approx(90.0)
+
+
+# ---------------------------------------------------------------------------
+# Optional fields: value and footprint
+# ---------------------------------------------------------------------------
+
+def test_value_and_footprint_parsed():
+    result = _parse(KICAD_STANDARD_CSV)
+    c1 = result.entries[0]
+    assert c1.value == "100nF"
+    assert c1.footprint == "C_0603"
+
+
+def test_missing_optional_fields_default_empty():
+    csv = """\
+Ref,PosX,PosY,Rot,Side
+X1,0,0,0,top
+"""
+    result = _parse(csv)
+    assert result.entries[0].value == ""
+    assert result.entries[0].footprint == ""
+
+
+# ---------------------------------------------------------------------------
+# Delimiter detection
+# ---------------------------------------------------------------------------
+
+TAB_DELIMITED_CSV = "Ref\tPosX\tPosY\tRot\tSide\nC1\t1.0\t2.0\t0\ttop\n"
+SEMICOLON_DELIMITED_CSV = "Ref;PosX;PosY;Rot;Side\nC1;1.0;2.0;0;top\n"
+
+
+def test_tab_delimiter():
+    result = _parse(TAB_DELIMITED_CSV)
+    assert len(result.entries) == 1
+    assert result.entries[0].designator == "C1"
+
+
+def test_semicolon_delimiter():
+    result = _parse(SEMICOLON_DELIMITED_CSV)
+    assert len(result.entries) == 1
+    assert result.entries[0].designator == "C1"
+
+
+# ---------------------------------------------------------------------------
+# Comment / BOM header filtering
+# ---------------------------------------------------------------------------
+
+CPL_WITH_COMMENTS = """\
+# Generated by KiCad EDA
+# Board: my_board
+Ref,PosX,PosY,Rot,Side
+C1,0,0,0,top
+"""
+
+
+def test_comment_lines_skipped():
+    result = _parse(CPL_WITH_COMMENTS)
+    assert len(result.entries) == 1
+    assert result.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# BOM marker (UTF-8 BOM) handling
+# ---------------------------------------------------------------------------
+
+def test_utf8_bom_stripped():
+    csv = "\ufeffRef,PosX,PosY,Rot,Side\nC1,0,0,0,top\n"
+    result = _parse(csv)
+    assert len(result.entries) == 1
+
+
+# ---------------------------------------------------------------------------
+# Empty / bad input
+# ---------------------------------------------------------------------------
+
+def test_empty_text_returns_warning():
+    result = _parse("")
+    assert result.entries == []
+    assert result.warnings
+
+
+def test_only_comments_returns_warning():
+    result = _parse("# just a comment\n# another comment\n")
+    assert result.entries == []
+    assert result.warnings
+
+
+def test_no_designator_column_returns_warning():
+    csv = "Value,PosX,PosY,Rot,Side\n100nF,0,0,0,top\n"
+    result = _parse(csv)
+    assert result.entries == []
+    assert any("designator" in w.lower() or "reference" in w.lower() for w in result.warnings)
+
+
+def test_row_with_empty_designator_is_skipped():
+    csv = "Ref,PosX,PosY,Rot,Side\n,0,0,0,top\nC1,1,2,0,top\n"
+    result = _parse(csv)
+    assert len(result.entries) == 1
+    assert result.skipped_rows == 1
+
+
+def test_invalid_float_defaults_to_zero():
+    csv = "Ref,PosX,PosY,Rot,Side\nC1,notanumber,?,invalid,top\n"
+    result = _parse(csv)
+    assert result.entries[0].x_pos == 0.0
+    assert result.entries[0].y_pos == 0.0
+    assert result.entries[0].rotation == 0.0
+
+
+# ---------------------------------------------------------------------------
+# source_file field
+# ---------------------------------------------------------------------------
+
+def test_source_file_propagated():
+    csv = "Ref,PosX,PosY,Rot,Side\nC1,0,0,0,top\n"
+    result = _make_parser().parse_text(csv, source_file="/path/to/cpl.csv", project_id=1)
+    assert result.source_file == "/path/to/cpl.csv"
+    assert result.entries[0].source_file == "/path/to/cpl.csv"
+
+
+# ---------------------------------------------------------------------------
+# validate_against_bom
+# ---------------------------------------------------------------------------
+
+def _entries(*refs: str) -> list[CplEntry]:
+    return [
+        CplEntry(project_id=1, source_file="", designator=ref, x_pos=0, y_pos=0,
+                 rotation=0, layer="Top", value="", footprint="")
+        for ref in refs
+    ]
+
+
+def test_validate_perfect_match():
+    warnings = _make_parser().validate_against_bom(
+        _entries("C1", "R1", "U1"),
+        ["C1", "R1", "U1"],
+    )
+    assert warnings == []
+
+
+def test_validate_bom_missing_from_cpl():
+    warnings = _make_parser().validate_against_bom(
+        _entries("C1"),
+        ["C1", "R1"],
+    )
+    assert len(warnings) == 1
+    assert "R1" in warnings[0]
+    assert "BOM" in warnings[0] or "no CPL" in warnings[0].lower() or "placement" in warnings[0]
+
+
+def test_validate_cpl_extra_not_in_bom():
+    warnings = _make_parser().validate_against_bom(
+        _entries("C1", "X99"),
+        ["C1"],
+    )
+    assert len(warnings) == 1
+    assert "X99" in warnings[0]
+
+
+def test_validate_case_insensitive():
+    warnings = _make_parser().validate_against_bom(
+        _entries("c1", "r1"),
+        ["C1", "R1"],
+    )
+    assert warnings == []
+
+
+def test_validate_empty_bom_designators_ignored():
+    warnings = _make_parser().validate_against_bom(
+        _entries("C1"),
+        ["C1", "", "  "],
+    )
+    assert warnings == []

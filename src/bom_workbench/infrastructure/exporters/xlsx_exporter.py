@@ -41,6 +41,14 @@ class XlsxExporter(IExporter):
         ("LCSC PART #", "lcsc_part_number"),
     ]
 
+    # JLCPCB assembly service requires this exact column order and names.
+    _jlcpcb_columns: list[tuple[str, str]] = [
+        ("Comment", "comment"),
+        ("Designator", "designator"),
+        ("Footprint", "footprint"),
+        ("LCSC Part #", "lcsc_part_number"),
+    ]
+
     async def export_procurement_bom(
         self,
         rows: Sequence[BomRow],
@@ -54,6 +62,22 @@ class XlsxExporter(IExporter):
             output_path,
             options,
             self._build_procurement_payload(row_list),
+        )
+
+    async def export_jlcpcb_assembly_bom(
+        self,
+        rows: Sequence[BomRow],
+        output_path: Path,
+        options: ExportOptions,
+    ) -> ExportResult:
+        """Export a BOM formatted for JLCPCB's SMT assembly service upload."""
+        row_list = list(rows)
+        return await asyncio.to_thread(
+            self._write_workbook,
+            row_list,
+            output_path,
+            options,
+            self._build_jlcpcb_payload(row_list),
         )
 
     async def export_full_table(
@@ -103,6 +127,37 @@ class XlsxExporter(IExporter):
             rows=payload_rows,
             headers=[header for header, _field in self._procurement_columns],
             sheet_title="BOM",
+            metadata_title="Metadata",
+            warnings=warnings,
+        )
+
+    def _build_jlcpcb_payload(self, rows: list[BomRow]) -> _ExportPayload:
+        payload_rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        missing_lcsc: list[str] = []
+        for row in rows:
+            row_data = self._row_mapping(row)
+            payload_rows.append(
+                {
+                    header: row_data.get(field, "")
+                    for header, field in self._jlcpcb_columns
+                }
+            )
+            if not row_data.get("lcsc_part_number"):
+                ref = row_data.get("designator") or f"row {row_data.get('original_row_index', '?')}"
+                missing_lcsc.append(ref)
+            warnings.extend(self._row_warnings(row_data, self._jlcpcb_columns))
+        if missing_lcsc:
+            warnings.insert(
+                0,
+                f"JLCPCB upload will fail for {len(missing_lcsc)} row(s) with no LCSC Part #: "
+                + ", ".join(missing_lcsc[:10])
+                + (" …" if len(missing_lcsc) > 10 else ""),
+            )
+        return _ExportPayload(
+            rows=payload_rows,
+            headers=[header for header, _field in self._jlcpcb_columns],
+            sheet_title="JLCPCB BOM",
             metadata_title="Metadata",
             warnings=warnings,
         )

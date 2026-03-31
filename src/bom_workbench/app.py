@@ -52,6 +52,7 @@ from bom_workbench.domain.ports import ExportOptions
 from bom_workbench.domain.value_objects import ColumnMapping
 from bom_workbench.infrastructure.csv import CsvParser
 from bom_workbench.infrastructure.csv.column_matcher import ColumnMatcher
+from bom_workbench.infrastructure.csv.cpl_parser import CplParser
 from bom_workbench.infrastructure.csv.normalizer import RowNormalizer
 from bom_workbench.infrastructure.exporters import XlsxExporter
 from bom_workbench.infrastructure.providers import (
@@ -816,8 +817,78 @@ def _wire_phase6_import_flow(window: MainWindow) -> None:
 
     window.import_requested.connect(on_import_requested)
 
+    async def _handle_cpl_import(file_path: str) -> None:
+        project_id = int(state.get("project_id", 0) or 0)
+        if project_id <= 0:
+            if import_page is not None:
+                import_page.set_cpl_status("No active project — import a BOM first.")
+            window.set_status_text("CPL import skipped: no active project")
+            return
+
+        window.set_status_text(f"Loading CPL file: {Path(file_path).name}")
+        try:
+            parse_result = CplParser().parse_file(file_path, project_id=project_id)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("cpl_parse_failed", path=file_path, error=str(exc))
+            if import_page is not None:
+                import_page.set_cpl_status(f"CPL parse error: {exc}")
+            window.set_status_text("CPL import failed")
+            return
+
+        if parse_result.warnings and not parse_result.entries:
+            msg = "; ".join(parse_result.warnings)
+            if import_page is not None:
+                import_page.set_cpl_status(f"CPL warning: {msg}")
+            window.set_status_text(f"CPL import skipped: {msg}")
+            return
+
+        # Keep only Top-side placements (JLCPCB assembly uses top-side CPL only).
+        all_entries = parse_result.entries
+        top_entries = [e for e in all_entries if e.layer == "Top"]
+        bottom_count = len(all_entries) - len(top_entries)
+
+        await repository.save_cpl_entries(top_entries, project_id)
+
+        # Cross-validate against current BOM designators.
+        rows: list[Any] = state.get("rows", [])
+        bom_designators = [
+            str(getattr(row, "designator", "") or "").strip()
+            for row in rows
+            if str(getattr(row, "designator", "") or "").strip()
+        ]
+        validation_warnings = CplParser().validate_against_bom(
+            top_entries, bom_designators
+        )
+
+        entry_count = len(top_entries)
+        status_parts = [f"{entry_count} placement(s) loaded from {Path(file_path).name}"]
+        if bottom_count:
+            status_parts.append(f"{bottom_count} bottom-side row(s) skipped")
+        if parse_result.skipped_rows:
+            status_parts.append(f"{parse_result.skipped_rows} row(s) skipped")
+        if parse_result.warnings:
+            status_parts.extend(parse_result.warnings)
+        if validation_warnings:
+            status_parts.extend(validation_warnings)
+
+        status_text = " | ".join(status_parts)
+        if import_page is not None:
+            import_page.set_cpl_status(status_text)
+        window.set_status_text(f"CPL loaded: {entry_count} placements")
+        logger.info(
+            "cpl_import_completed",
+            project_id=project_id,
+            entry_count=entry_count,
+            bottom_skipped=bottom_count,
+            skipped_rows=parse_result.skipped_rows,
+            warnings=parse_result.warnings + validation_warnings,
+        )
+
     if import_page is not None:
         import_page.import_requested.connect(request_import)
+        import_page.cpl_import_requested.connect(
+            lambda path: _schedule_async(_handle_cpl_import(path))
+        )
 
     if bom_table_page is not None:
         bom_table_page.row_selected.connect(on_row_selected)
@@ -2315,7 +2386,8 @@ def _wire_phase10_export_flow(window: MainWindow) -> None:
     def _default_output_path(target: str) -> Path:
         target_slug = target.replace("current_filtered_view", "filtered_view")
         project_name = str(state.get("project_name", "")).strip() or "bom"
-        return Path.cwd() / f"{project_name}_{target_slug}.xlsx"
+        ext = ".csv" if target == "jlcpcb_cpl" else ".xlsx"
+        return Path.cwd() / f"{project_name}_{target_slug}{ext}"
 
     def _result_payload(result: Any) -> dict[str, Any]:
         return {
@@ -2326,6 +2398,52 @@ def _wire_phase10_export_flow(window: MainWindow) -> None:
             "duration_seconds": float(result.duration_seconds),
             "file_size_bytes": int(result.file_size_bytes),
         }
+
+    async def _run_cpl_export(output_path: Path) -> None:
+        import csv as _csv
+
+        project_id = int(state.get("project_id", 0) or 0)
+        entries = await repository.list_cpl_entries(project_id)
+        if not entries:
+            export_page.set_status_message(
+                "No CPL data found — import a pick-and-place file first."
+            )
+            window.set_status_text("CPL export blocked: no CPL entries")
+            return
+
+        jlcpcb_columns = [
+            ("Designator", "designator"),
+            ("Comment", "value"),
+            ("Footprint", "footprint"),
+            ("Mid X", "x_pos"),
+            ("Mid Y", "y_pos"),
+            ("Rotation", "rotation"),
+            ("Layer", "layer"),
+        ]
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=[col for col, _ in jlcpcb_columns])
+            writer.writeheader()
+            for entry in entries:
+                writer.writerow({
+                    col: getattr(entry, field, "")
+                    for col, field in jlcpcb_columns
+                })
+
+        export_page.set_last_export_result({
+            "output_path": str(output_path),
+            "rows_exported": len(entries),
+        })
+        export_page.set_status_message(
+            f"Exported {len(entries)} placement(s) to {output_path.name}."
+        )
+        window.set_status_text(f"CPL export complete: {output_path.name}")
+        export_logger.info(
+            "cpl_export_completed",
+            project_id=project_id,
+            entry_count=len(entries),
+            output_path=str(output_path),
+        )
 
     async def _run_export(payload: Mapping[str, Any], output_path: Path) -> None:
         rows = await _project_rows()
@@ -2404,6 +2522,24 @@ def _wire_phase10_export_flow(window: MainWindow) -> None:
             return
 
         target = str(payload.get("target", "procurement_bom")).strip().lower()
+
+        if target == "jlcpcb_cpl":
+            output_name, _selected_filter = QFileDialog.getSaveFileName(
+                window,
+                "Export JLCPCB CPL",
+                str(_default_output_path(target)),
+                "CSV Files (*.csv);;All Files (*)",
+            )
+            if not output_name:
+                export_page.set_status_message("Export cancelled.")
+                window.set_status_text("Export cancelled")
+                return
+            output_path = Path(output_name)
+            if output_path.suffix.lower() != ".csv":
+                output_path = output_path.with_suffix(".csv")
+            _schedule_async(_run_cpl_export(output_path))
+            return
+
         output_name, _selected_filter = QFileDialog.getSaveFileName(
             window,
             "Export Workbook",

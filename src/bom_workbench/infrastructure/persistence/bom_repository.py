@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from sqlmodel import Session, select
 
-from ...domain.entities import BomProject, BomRow
+from ...domain.entities import BomProject, BomRow, CplEntry
 from ...domain.ports import IBomRepository
 
 __all__ = ["SqliteBomRepository"]
@@ -98,6 +98,40 @@ class SqliteBomRepository(IBomRepository):
             if row is not None:
                 session.delete(row)
                 session.commit()
+
+    async def save_cpl_entries(
+        self, entries: list[CplEntry], project_id: int
+    ) -> list[CplEntry]:
+        with self._session_factory() as session:
+            # Delete existing entries for this project first (replace semantics).
+            existing_stmt = select(CplEntry).where(CplEntry.project_id == project_id)
+            for old in session.exec(existing_stmt).all():
+                session.delete(old)
+            saved: list[CplEntry] = []
+            for entry in entries:
+                entry.project_id = project_id
+                session.add(entry)
+                saved.append(entry)
+            session.commit()
+            for entry in saved:
+                session.refresh(entry)
+            return saved
+
+    async def list_cpl_entries(self, project_id: int) -> list[CplEntry]:
+        with self._session_factory() as session:
+            statement = (
+                select(CplEntry)
+                .where(CplEntry.project_id == project_id)
+                .order_by(CplEntry.designator.asc())
+            )
+            return list(session.exec(statement).all())
+
+    async def delete_cpl_entries(self, project_id: int) -> None:
+        with self._session_factory() as session:
+            statement = select(CplEntry).where(CplEntry.project_id == project_id)
+            for entry in session.exec(statement).all():
+                session.delete(entry)
+            session.commit()
 
     def _save_project(self, session: Session, project: BomProject) -> BomProject:
         if project.id is None:

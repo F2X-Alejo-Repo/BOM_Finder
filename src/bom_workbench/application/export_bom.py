@@ -11,6 +11,7 @@ from bom_workbench.domain.ports import ExportOptions, ExportResult, IExporter
 
 ExportTarget = Literal[
     "procurement_bom",
+    "jlcpcb_assembly_bom",
     "full_table",
     "filtered_view",
     "current_filtered_view",
@@ -27,6 +28,7 @@ class ExportBomUseCase:
 
     _target_aliases: dict[str, str] = {
         "procurement_bom": "procurement_bom",
+        "jlcpcb_assembly_bom": "jlcpcb_assembly_bom",
         "full_table": "full_table",
         "filtered_view": "filtered_view",
         "current_filtered_view": "filtered_view",
@@ -54,6 +56,12 @@ class ExportBomUseCase:
 
         if normalized_target == "procurement_bom":
             return await self._exporter.export_procurement_bom(
+                row_list,
+                output,
+                export_options,
+            )
+        if normalized_target == "jlcpcb_assembly_bom":
+            return await self._exporter.export_jlcpcb_assembly_bom(
                 row_list,
                 output,
                 export_options,

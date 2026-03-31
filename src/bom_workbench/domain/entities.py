@@ -8,6 +8,7 @@ from sqlmodel import Field, Relationship, SQLModel
 __all__ = [
     "BomProject",
     "BomRow",
+    "CplEntry",
     "ProviderConfig",
     "Job",
 ]
@@ -85,6 +86,22 @@ class BomRow(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utc_now)
 
     project: Optional[BomProject] = Relationship(back_populates="rows")
+
+
+class CplEntry(SQLModel, table=True):
+    """One component placement entry from a KiCad pick-and-place / CPL CSV."""
+
+    id: int | None = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="bomproject.id", index=True)
+    source_file: str = ""
+    designator: str = Field(index=True)
+    x_pos: float = 0.0       # mm
+    y_pos: float = 0.0       # mm
+    rotation: float = 0.0    # degrees
+    layer: str = "Top"       # "Top" or "Bottom"
+    value: str = ""          # component value from CPL (optional)
+    footprint: str = ""      # footprint from CPL (optional)
+    created_at: datetime = Field(default_factory=_utc_now)
 
 
 class ProviderConfig(SQLModel, table=True):

@@ -24,6 +24,7 @@
 | 18 | [release-rollout-and-rollback.md](18-release-rollout-and-rollback.md) | Release channels, rollout checklist, rollback triggers and comms |
 | 19 | [slos-observability-and-incident-runbooks.md](19-slos-observability-and-incident-runbooks.md) | SLIs/SLOs, alerts, diagnostics, incident runbook contracts |
 | 20 | [cost-and-provider-usage-guardrails.md](20-cost-and-provider-usage-guardrails.md) | Token/cost budgets, hard limits, circuit breakers, spend controls |
+| 21 | [kicad-fabrication-integration.md](21-kicad-fabrication-integration.md) | KiCad/fabrication integration roadmap: footprint normalization, JLCPCB export, CPL import, native KiCad file parsing, IPC API |
 
 ## Context
 

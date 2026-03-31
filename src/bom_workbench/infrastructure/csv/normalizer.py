@@ -221,6 +221,9 @@ class RowNormalizer(NormalizationService):
                 row_warnings=row_warnings,
             )
 
+        if canonical_field == "footprint":
+            return self._normalize_footprint(raw_value)
+
         if self._is_multi_value_field(canonical_field):
             return self._normalize_multi_value_cell(
                 raw_value,
@@ -393,6 +396,56 @@ class RowNormalizer(NormalizationService):
     def _serialize_warnings(self, warnings: Sequence[ValidationWarning]) -> str:
         payload = [warning.model_dump(mode="json") for warning in warnings]
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    # KiCad exports footprints as "Library:Footprint_Name" (e.g. "Capacitor_SMD:C_0603_1608Metric").
+    # Extract the IPC/JEDEC package code so LCSC/JLCPCB searches work correctly.
+    # Note: use (?<![a-zA-Z0-9]) / (?![a-zA-Z0-9]) instead of \b because Python's \b treats
+    # underscore as a word character, which breaks matching inside "C_0603_1608Metric".
+    _KICAD_IPC_PACKAGE = re.compile(
+        r"(?<![a-zA-Z0-9])"
+        r"((?:01005|0201|0402|0603|0805|1206|1210|1812|2010|2512|2920)"
+        r"|(?:SOT-?(?:23|89|143|223|323|363|523|563|723|883)(?:-[0-9]+)?)"
+        r"|(?:SOIC?-?[0-9]+(?:W|N)?)"
+        r"|(?:TSSOP-?[0-9]+)"
+        r"|(?:QFP-?[0-9]+|LQFP-?[0-9]+|TQFP-?[0-9]+)"
+        r"|(?:QFN-?[0-9]+|DFN-?[0-9]+|MLF-?[0-9]+)"
+        r"|(?:BGA-?[0-9]+)"
+        r"|(?:TO-?(?:92|220|247|263|252|263)(?:AB|F)?)"
+        r"|(?:SMA|SMB|SMC|DO-?(?:214|215|219)(?:A|B|C|AC)?)"
+        r"|(?:D(?:PAK|2PAK))"
+        r"|(?:DIP-?[0-9]+)"
+        r")(?![a-zA-Z0-9])",
+        re.IGNORECASE,
+    )
+
+    def _normalize_footprint(self, raw_value: str) -> str:
+        """Normalize a KiCad-style footprint string to a plain package identifier.
+
+        KiCad uses "Library:Footprint_Name" notation (e.g. "Capacitor_SMD:C_0603_1608Metric").
+        This strips the library prefix and extracts the IPC package code when possible,
+        so searches against LCSC/JLCPCB work correctly.
+
+        Examples:
+            "Capacitor_SMD:C_0603_1608Metric"  → "0603"
+            "Resistor_SMD:R_0402_1005Metric"   → "0402"
+            "Package_SO:SOIC-8_3.9x4.9mm_P1.27mm" → "SOIC-8"
+            "0603"                              → "0603"  (passthrough)
+        """
+        text = self.normalize_value(raw_value, max_length=None)
+        if not text:
+            return text
+
+        # Strip "Library:" prefix if present.
+        if ":" in text:
+            text = text.split(":", 1)[1].strip()
+
+        # Try to extract a known IPC/JEDEC package code from the footprint name.
+        match = self._KICAD_IPC_PACKAGE.search(text)
+        if match:
+            return match.group(1).upper()
+
+        # Fallback: return the footprint name without the library prefix.
+        return text
 
     def _normalize_cell_text(self, raw_value: Any) -> str:
         if raw_value is None:

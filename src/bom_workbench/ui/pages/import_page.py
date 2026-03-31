@@ -27,6 +27,7 @@ class ImportPage(SimplePage):
     """Page for BOM import entry points."""
 
     import_requested = Signal(list)
+    cpl_import_requested = Signal(str)  # emits the CPL file path
 
     def __init__(self) -> None:
         super().__init__(
@@ -72,6 +73,43 @@ class ImportPage(SimplePage):
         intake_layout.addWidget(hint)
         intake_layout.addLayout(button_row)
 
+        # CPL / pick-and-place file section.
+        cpl_card = QFrame(self)
+        cpl_card.setObjectName("CplIntakeCard")
+        cpl_card.setFrameShape(QFrame.Shape.StyledPanel)
+        cpl_layout = QVBoxLayout(cpl_card)
+        cpl_layout.setContentsMargins(18, 18, 18, 18)
+        cpl_layout.setSpacing(8)
+
+        self.cpl_drop_zone = DropZone(
+            "Drop KiCad pick-and-place / CPL file here (optional)",
+            cpl_card,
+        )
+        self.cpl_drop_zone.setMinimumHeight(100)
+        self.cpl_drop_zone.files_dropped.connect(self._handle_dropped_cpl)
+
+        cpl_hint = QLabel(
+            "Import a KiCad CPL (pick-and-place) CSV file to enable placement "
+            "cross-validation and JLCPCB assembly export.",
+            cpl_card,
+        )
+        cpl_hint.setWordWrap(True)
+        cpl_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        cpl_button_row = QHBoxLayout()
+        cpl_button_row.setSpacing(10)
+        self.browse_cpl_button = QPushButton("Browse CPL File", cpl_card)
+        self.browse_cpl_button.clicked.connect(self._browse_cpl)
+        self.cpl_status_label = QLabel("No CPL file loaded.", cpl_card)
+        self.cpl_status_label.setWordWrap(True)
+        cpl_button_row.addWidget(self.browse_cpl_button)
+        cpl_button_row.addStretch(1)
+
+        cpl_layout.addWidget(self.cpl_drop_zone)
+        cpl_layout.addWidget(cpl_hint)
+        cpl_layout.addLayout(cpl_button_row)
+        cpl_layout.addWidget(self.cpl_status_label)
+
         recent_card = create_card("Recent Imports", [])
         self.recent_imports_list = QListWidget(recent_card)
         self.recent_imports_list.setSelectionMode(
@@ -83,9 +121,16 @@ class ImportPage(SimplePage):
         if recent_layout is not None:
             recent_layout.addWidget(self.recent_imports_list)
 
+        left_panel = QFrame(self)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+        left_layout.addWidget(intake_card, 3)
+        left_layout.addWidget(cpl_card, 1)
+
         self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.workspace_splitter.setChildrenCollapsible(False)
-        self.workspace_splitter.addWidget(intake_card)
+        self.workspace_splitter.addWidget(left_panel)
         self.workspace_splitter.addWidget(recent_card)
         self.workspace_splitter.setStretchFactor(0, 3)
         self.workspace_splitter.setStretchFactor(1, 2)
@@ -112,6 +157,24 @@ class ImportPage(SimplePage):
     def recent_imports(self) -> list[dict[str, Any]]:
         """Return the normalized recent-import entries currently shown."""
         return [dict(entry) for entry in self._recent_imports]
+
+    def set_cpl_status(self, text: str) -> None:
+        """Update the CPL status label (e.g. after a CPL is loaded)."""
+        self.cpl_status_label.setText(text.strip())
+
+    def _browse_cpl(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Pick-and-Place / CPL File",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if file_path:
+            self.cpl_import_requested.emit(file_path)
+
+    def _handle_dropped_cpl(self, paths: list[str]) -> None:
+        if paths:
+            self.cpl_import_requested.emit(paths[0])
 
     def _browse_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
